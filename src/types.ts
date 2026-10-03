@@ -3,8 +3,9 @@ export interface Player {
   displayName: string;
   authAt: number;
   expiresAt?: number;
+  tokenId?: string;
+  issuedAt?: number;
 }
-
 export interface Game {
   gameId: string;
   name: string;
@@ -12,48 +13,88 @@ export interface Game {
   enabled: boolean;
   source: 'api' | 'cache' | 'config';
   serverHint?: string;
+  versions?: readonly string[];
+  modes?: readonly string[];
+  regions?: readonly string[];
 }
-
-export interface AuthProvider {
-  verify(token: string): Promise<Player>;
-}
-
-export interface GameProvider {
-  list(force?: boolean): Promise<readonly Game[]>;
-}
-
+export interface AuthProvider { verify(token: string): Promise<Player> }
+export interface GameProvider { list(force?: boolean): Promise<readonly Game[]> }
 export interface Peer {
   readonly id: string;
   readonly ip: string;
   readonly closed: boolean;
   send(message: Record<string, unknown>): void;
+  reply?(message: Record<string, unknown>): void;
   close(code?: number, reason?: string): void;
 }
-
 export interface Session {
   peer: Peer;
   player?: Player;
   gameId?: string;
   roomId?: string;
   active: boolean;
+  disconnectedAt?: number;
+  ready?: boolean;
+  role?: 'player' | 'spectator';
+  compatibility?: { version: string; mode: string; region: string };
 }
-
 export interface StoredRoom {
   id: string;
   gameId: string;
   name: string;
+  ownerId: string;
   hostId: string;
   passwordHash: string | null;
   maxPlayers: number;
-  state: 'open' | 'closed';
+  state: 'open' | 'starting' | 'in_game' | 'closed';
+  visibility: 'public' | 'unlisted' | 'invite';
+  locked: boolean;
+  version: string;
+  mode: string;
+  region: string;
+  joinPolicy: 'closed' | 'fill' | 'spectate';
+  maxSpectators: number;
+  revision: number;
+  bannedIds: string[];
+  invitedIds: string[];
+  matchId: string | null;
+  matchRequest?: MatchRequest;
   createdAt: number;
   updatedAt: number;
 }
-
+export interface Moderation { playerId: string; bannedUntil: number; revokedBefore: number; reason: string }
+export interface SocialLink { a: string; b: string; status: 'pending' | 'accepted'; requestedBy: string }
+export interface AuditEvent { at: number; actor: string; action: string; target: string }
 export interface RoomStore {
   load(): StoredRoom[];
   insert(room: StoredRoom): void;
+  update(room: StoredRoom): void;
   setHost(id: string, hostId: string, updatedAt: number): void;
   delete(id: string): void;
+  listModeration(): Moderation[];
+  saveModeration(record: Moderation): void;
+  listSocial(): SocialLink[];
+  saveSocial(link: SocialLink): void;
+  deleteSocial(a: string, b: string): void;
+  audit(event: AuditEvent): void;
+  listAudit(limit: number): AuditEvent[];
   close(): void;
 }
+export interface MatchRequest {
+  operationId: string;
+  roomId: string;
+  gameId: string;
+  players: { id: string; role: 'player' | 'spectator' }[];
+  version: string;
+  mode: string;
+  region: string;
+}
+export interface Admission { serverUrl: string; ticket: string; expiresAt: number }
+export interface MatchAllocation { matchId: string; serverUrl: string; expiresAt: number; tickets: Record<string, string> }
+export interface GameSessionProvider {
+  create(input: MatchRequest): Promise<MatchAllocation>;
+  admit(matchId: string, playerId: string, role: 'player' | 'spectator'): Promise<Admission>;
+  status(matchId: string): Promise<'starting' | 'in_game' | 'ended' | 'failed'>;
+  cancel(matchId: string): Promise<void>;
+}
+export interface Revocation { playerId?: string; tokenId?: string; revokedBefore?: number }

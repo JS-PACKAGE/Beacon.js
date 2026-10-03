@@ -14,7 +14,11 @@ export async function backupDatabase(source: string, destination: string): Promi
     db = new DatabaseSync(source, { readOnly: true, allowExtension: false });
     const integrity = db.prepare('PRAGMA integrity_check').all();
     if (integrity.length !== 1 || integrity[0]?.integrity_check !== 'ok') throw new Error('Source database integrity check failed');
-    await backup(db, destination);
+    // node:sqlite's async backup() is not woken by its own worker progress: while any other handle
+    // keeps the loop parked in poll, it only advances at the next unrelated wakeup (measured: it waited
+    // for an unrelated 7 s timer, or 30 s with an HTTP server listening). A brief ticking timer bounds that.
+    const wake = setInterval(() => undefined, 5);
+    try { await backup(db, destination); } finally { clearInterval(wake); }
     await chmod(destination, 0o600);
   } catch (error) {
     await unlink(destination);

@@ -1,12 +1,15 @@
 import { readFile } from 'node:fs/promises';
 import { isIP } from 'node:net';
 import type { Game } from './types.js';
+import { readSecretFile } from './auth/secrets.js';
 
 export interface Config {
   server: { listenHost: string; listenPort: number; trustProxy: boolean; trustedProxyAddresses: string[]; allowedOrigins: string[]; allowNoOrigin: boolean };
   public: { domain: string; tls: 'proxy' | 'direct'; certPath: string; keyPath: string };
-  auth: { mode: 'mock' | 'jwks' | 'remote'; jwksUrl: string; issuer: string; audience: string; apiUrl: string; timeoutMs: number; jwksCacheTtlSec: number; mockPlayers: { token: string; id: string; displayName: string }[] };
-  games: { apiUrl: string; timeoutMs: number; cacheTtlSec: number; fallback: Omit<Game, 'source'>[] };
+  auth: { mode: 'mock' | 'jwks' | 'remote'; jwksUrl: string; issuer: string; audience: string; apiUrl: string; timeoutMs: number; jwksCacheTtlSec: number; mockPlayers: { token: string; id: string; displayName: string }[]; revocationUrl: string; revocationIntervalMs: number };
+  games: { apiUrl: string; timeoutMs: number; cacheTtlSec: number; fallback: Omit<Game, 'source'>[]; sessionApiUrl: string; serviceTokenFile: string };
+  lobby: { reconnectGraceMs: number; maxRoomsPerPlayer: number; requestCacheSize: number; requestCacheTtlMs: number; snapshotTtlMs: number; inviteTtlMs: number; maxSpectators: number; matchmakingWaitMs: number; maxPartySize: number };
+  operations: { enabled: boolean; listenHost: string; listenPort: number; tokenFile: string; logPath: string; logMaxBytes: number; logFiles: number; backupDirectory: string; backupIntervalMs: number; backupRetention: number; alertUrl: string; alertTokenFile: string; alertIntervalMs: number; drainTimeoutMs: number };
   room: { emptyTtlSec: number };
   db: { path: string };
   limits: { authDeadlineMs: number; heartbeatIntervalMs: number; heartbeatTimeoutMs: number; maxConnectionsPerIp: number; maxConnections: number; connectionBurst: number; connectionWindowMs: number; messageBurst: number; messageWindowMs: number; maxRateViolations: number; passwordFailures: number; passwordWindowMs: number; maxRoomsPerGame: number; inboundBytes: number; outboundBytes: number; maxBufferedBytes: number; socketHighWaterMark: number; defaultPageSize: number; maxPageSize: number; maintenanceIntervalMs: number };
@@ -42,7 +45,7 @@ function keys(object: Record<string, unknown>, allowed: readonly string[], name:
 
 export function validateConfig(value: unknown, dev: DevOptions): Config {
   const root = record(value, 'root');
-  keys(root, ['server', 'public', 'auth', 'games', 'room', 'db', 'limits'], 'root');
+  keys(root, ['server', 'public', 'auth', 'games', 'room', 'db', 'limits', 'lobby', 'operations'], 'root');
   const server = record(root.server, 'server');
   keys(server, ['listenHost', 'listenPort', 'trustProxy', 'trustedProxyAddresses', 'allowedOrigins', 'allowNoOrigin'], 'server');
   string(server.listenHost, 'listenHost');
@@ -58,7 +61,8 @@ export function validateConfig(value: unknown, dev: DevOptions): Config {
   if (pub.tls === 'direct' && (!pub.certPath || !pub.keyPath)) throw new Error('Direct TLS requires certificate and private key paths');
   if (pub.tls === 'proxy' && server.trustProxy !== true && !dev.insecureWs) throw new Error('Proxy TLS requires trustProxy');
   const auth = record(root.auth, 'auth');
-  keys(auth, ['mode', 'jwksUrl', 'issuer', 'audience', 'apiUrl', 'timeoutMs', 'jwksCacheTtlSec', 'mockPlayers'], 'auth');
+  keys(auth, ['mode', 'jwksUrl', 'issuer', 'audience', 'apiUrl', 'timeoutMs', 'jwksCacheTtlSec', 'mockPlayers', 'revocationUrl', 'revocationIntervalMs'], 'auth');
+  string(auth.revocationUrl, 'auth.revocationUrl', true); integer(auth.revocationIntervalMs, 'auth.revocationIntervalMs');
   if (!['mock', 'jwks', 'remote'].includes(String(auth.mode))) throw new Error('Invalid auth.mode');
   if (auth.mode === 'mock' && !dev.mockAuth) throw new Error('Mock authentication requires --dev-mock-auth');
   for (const key of ['jwksUrl', 'issuer', 'audience', 'apiUrl']) string(auth[key], `auth.${key}`, true);
@@ -71,15 +75,36 @@ export function validateConfig(value: unknown, dev: DevOptions): Config {
     for (const key of ['token', 'id', 'displayName']) string(player[key], `mockPlayers.${key}`);
   }
   const games = record(root.games, 'games');
-  keys(games, ['apiUrl', 'timeoutMs', 'cacheTtlSec', 'fallback'], 'games');
+  keys(games, ['apiUrl', 'timeoutMs', 'cacheTtlSec', 'fallback', 'sessionApiUrl', 'serviceTokenFile'], 'games');
+  string(games.sessionApiUrl, 'games.sessionApiUrl', true); string(games.serviceTokenFile, 'games.serviceTokenFile', true);
+  if (games.serviceTokenFile) readSecretFile(games.serviceTokenFile);
   string(games.apiUrl, 'games.apiUrl', true); integer(games.timeoutMs, 'games.timeoutMs'); integer(games.cacheTtlSec, 'games.cacheTtlSec');
   if (!Array.isArray(games.fallback)) throw new Error('Invalid games.fallback');
   for (const entry of games.fallback) {
     const game = record(entry, 'fallback');
+    for (const key of Object.keys(game)) if (!['gameId', 'name', 'maxPlayersPerRoom', 'enabled', 'serverHint', 'versions', 'modes', 'regions'].includes(key)) throw new Error(`Unknown config game key: ${key}`);
     string(game.gameId, 'gameId'); string(game.name, 'game.name'); integer(game.maxPlayersPerRoom, 'maxPlayersPerRoom'); boolean(game.enabled, 'game.enabled');
     if (game.serverHint !== undefined) string(game.serverHint, 'serverHint');
+    for (const key of ['versions', 'modes', 'regions']) if (game[key] !== undefined) {
+      const values = game[key];
+      if (!Array.isArray(values) || values.length > 32 || !values.every(v => typeof v === 'string' && v.length > 0 && Buffer.byteLength(v) <= 64 && !/[\p{Cc}\p{Cs}]/u.test(v))) throw new Error(`Invalid game.${key}`);
+      game[key] = Object.freeze([...values]);
+    }
   }
-  for (const endpoint of [auth.mode === 'jwks' ? auth.jwksUrl : auth.apiUrl, games.apiUrl]) {
+  const operations = record(root.operations, 'operations');
+  keys(operations, ['enabled', 'listenHost', 'listenPort', 'tokenFile', 'logPath', 'logMaxBytes', 'logFiles', 'backupDirectory', 'backupIntervalMs', 'backupRetention', 'alertUrl', 'alertTokenFile', 'alertIntervalMs', 'drainTimeoutMs'], 'operations');
+  boolean(operations.enabled, 'operations.enabled'); string(operations.listenHost, 'operations.listenHost');
+  if (!isLoopback(operations.listenHost)) throw new Error('Operations must listen on loopback');
+  integer(operations.listenPort, 'operations.listenPort', 0, 65535);
+  for (const key of ['tokenFile', 'logPath', 'backupDirectory', 'alertUrl', 'alertTokenFile']) string(operations[key], `operations.${key}`, true);
+  for (const key of ['logMaxBytes', 'logFiles', 'backupIntervalMs', 'backupRetention', 'alertIntervalMs', 'drainTimeoutMs']) integer(operations[key], `operations.${key}`, key === 'drainTimeoutMs' ? 0 : 1);
+  if (operations.enabled && !operations.tokenFile) throw new Error('Operations requires a token file');
+  for (const key of ['tokenFile', 'alertTokenFile']) if (operations[key]) readSecretFile(String(operations[key]));
+  const lobby = record(root.lobby, 'lobby');
+  const lobbyKeys = ['reconnectGraceMs', 'maxRoomsPerPlayer', 'requestCacheSize', 'requestCacheTtlMs', 'snapshotTtlMs', 'inviteTtlMs', 'maxSpectators', 'matchmakingWaitMs', 'maxPartySize'];
+  keys(lobby, lobbyKeys, 'lobby');
+  for (const key of lobbyKeys) integer(lobby[key], `lobby.${key}`, key === 'maxSpectators' || key === 'reconnectGraceMs' ? 0 : 1);
+  for (const endpoint of [auth.mode === 'jwks' ? auth.jwksUrl : auth.apiUrl, auth.revocationUrl, games.apiUrl, games.sessionApiUrl, operations.alertUrl]) {
     if (endpoint) {
       const url = new URL(String(endpoint));
       if (url.username || url.password || url.hash) throw new Error('API URLs cannot contain credentials or fragments');

@@ -23,6 +23,8 @@
     "apiUrl": "", # remote 模式：驗證 API 基底網址，會 POST /v1/verify
     "timeoutMs": 5000, # 驗證 API 呼叫逾時，毫秒；失敗一律拒絕登入
     "jwksCacheTtlSec": 300, # JWKS 公鑰快取有效秒數
+    "revocationUrl": "", # HTTPS 撤銷清單（GET，無認證標頭）；空值明確停用。設定後為必要依賴，失敗時 fail-closed
+    "revocationIntervalMs": 60000, # 撤銷清單輪詢間隔，毫秒
     "mockPlayers": [ # 僅供本機測試的固定 token 與身分，非正式憑證
       { "token": "dev-alice", "id": "alice", "displayName": "Alice" },
       { "token": "dev-bob", "id": "bob", "displayName": "Bob" },
@@ -33,10 +35,39 @@
     "apiUrl": "", # HTTPS API 基底網址，會 GET /v1/games；空值採設定備援
     "timeoutMs": 5000, # 遊戲 API 呼叫逾時，毫秒
     "cacheTtlSec": 60, # 遊戲清單快取有效秒數
+    "sessionApiUrl": "", # 真實配對 API；未設定時拒絕開始遊戲
+    "serviceTokenFile": "", # 私密一般檔案 (0600)，不得符號連結
     "fallback": [ # API 不可達時的啟動備援，正式環境須換成實際遊戲
       { "gameId": "g-001", "name": "Demo game", "maxPlayersPerRoom": 8, "enabled": true },
       { "gameId": "g-002", "name": "Second game", "maxPlayersPerRoom": 4, "enabled": true }
     ]
+  },
+  "lobby": { # 大廳行為與配額；調整後需重啟
+    "reconnectGraceMs": 30000, # 斷線後保留席位與準備狀態的毫秒數；0＝立即離房。恢復須重新驗證
+    "maxRoomsPerPlayer": 3, # 每位擁有者可持有的房間數，含已離開的空房（空房依 room.emptyTtlSec 清除）
+    "requestCacheSize": 128, # 每位玩家冪等重播保留的請求數
+    "requestCacheTtlMs": 120000, # 冪等重播保留毫秒數；同 requestId 同內容在期限內不會重複執行
+    "snapshotTtlMs": 30000, # list_rooms 穩定游標快照的有效毫秒數
+    "inviteTtlMs": 300000, # 房間／隊伍邀請的有效毫秒數
+    "maxSpectators": 16, # 每房觀戰者上限的預設與最大值；0＝不允許觀戰
+    "matchmakingWaitMs": 60000, # 自動配對最長等待毫秒數，逾時退出佇列
+    "maxPartySize": 8 # 隊伍人數上限
+  },
+  "operations": { # 內部管理與維運；各項留空即明確停用，不會假裝成功
+    "enabled": false, # true 才開啟 loopback 管理 HTTP（所有端點皆需 bearer token）
+    "listenHost": "127.0.0.1", # 管理 HTTP 只接受 loopback
+    "listenPort": 34569, # 管理 HTTP 埠，勿對外轉送
+    "tokenFile": "", # 管理 bearer token 檔：一般檔案、0600、非符號連結；內容不入此設定檔
+    "logPath": "", # 持久輪替日誌檔路徑（私密目錄）；空值＝僅標準輸出
+    "logMaxBytes": 10485760, # 單一日誌檔大小上限，超過即輪替
+    "logFiles": 5, # 保留的輪替檔數
+    "backupDirectory": "", # 排程 SQLite 備份目錄（私密目錄）；空值＝停用排程備份
+    "backupIntervalMs": 3600000, # 備份間隔，毫秒
+    "backupRetention": 7, # 只保留最近幾份由本程式建立的備份
+    "alertUrl": "", # 告警 webhook（HTTPS；開發時允許 loopback HTTP）；空值＝停用
+    "alertTokenFile": "", # 告警 bearer token 檔（0600）；可留空
+    "alertIntervalMs": 60000, # 告警檢查與同類告警冷卻間隔，毫秒
+    "drainTimeoutMs": 10000 # 關機時先送 server_draining 並等待的毫秒數；0＝立即關閉
   },
   "room": { "emptyTtlSec": 1800 }, # 空房保留秒數，0＝永不自動清除；重啟後重新計時
   "db": { "path": "data/beacon.db" }, # SQLite 房間資料檔，0600 權限、WAL 模式
