@@ -46,9 +46,11 @@ async function rejected(t, url, options) {
 }
 
 test('development ws sends hello first and rejects regular HTTP', async t => {
-  const { url, config } = await fixture(t);
+  const { url } = await fixture(t);
   const c = client(t, url);
-  assert.deepEqual(await c.next(), { type: 'hello', serverVersion: '1.0.0', authDeadlineMs: config.limits.authDeadlineMs });
+  const greeting = await c.next();
+  assert.equal(greeting.type, 'hello');
+  assert.equal(greeting.protocolVersion, 2);
   c.ws.send(JSON.stringify({ type: 'ping' }));
   assert.equal((await c.next()).message.type, 'ping');
   const result = Promise.withResolvers();

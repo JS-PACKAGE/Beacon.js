@@ -16,7 +16,11 @@ export interface TransportHandlers {
   onMessage(peer: Peer, message: ClientMessage): Promise<void>;
   onClose(peer: Peer): void;
 }
-export interface Transport { address(): AddressInfo; close(): Promise<void> }
+export interface Transport {
+  address(): AddressInfo;
+  drain(deadline: number): void;
+  close(): Promise<void>;
+}
 const authentication = new WeakMap<Peer, (expiresAt?: number) => void>();
 export function markAuthenticated(peer: Peer, expiresAt?: number): void { authentication.get(peer)?.(expiresAt); }
 
@@ -33,6 +37,7 @@ export async function startTransport(config: Config, dev: DevOptions, handlers: 
   const attempts = new Map<string, { bucket: TokenBucket; seenAt: number }>();
   const sockets = new Set<Socket>();
   let stopping = false;
+  let closedTransport = false;
   server.on('connection', socket => {
     sockets.add(socket);
     socket.once('close', () => sockets.delete(socket));
@@ -163,7 +168,7 @@ export async function startTransport(config: Config, dev: DevOptions, handlers: 
         const bytes = Array.isArray(data) ? data.reduce((total, chunk) => total + chunk.length, 0) : data.byteLength;
         if (bytes > Math.min(4096, config.limits.inboundBytes)) { peer.close(1009, 'Inbound limit'); return; }
         if (!bucket.take()) {
-          peer.send(errorMessage('rate_limited'));
+          peer.send({ ...errorMessage('rate_limited'), ...(messageRequestId(data) ? { requestId: messageRequestId(data), ok: false } : {}) });
           if (++rateViolations >= config.limits.maxRateViolations) peer.close(1008, 'Rate limit');
           return;
         }
@@ -172,7 +177,7 @@ export async function startTransport(config: Config, dev: DevOptions, handlers: 
           const text = Array.isArray(data) ? Buffer.concat(data).toString('utf8') : Buffer.isBuffer(data) ? data.toString('utf8') : Buffer.from(data).toString('utf8');
           message = parseClient(text, config.limits.maxPageSize);
         } catch (error) {
-          peer.send(errorMessage(error instanceof ProtocolError ? error.code : 'bad_request'));
+          peer.send({ ...errorMessage(error instanceof ProtocolError ? error.code : 'bad_request'), ...(messageRequestId(data) ? { requestId: messageRequestId(data), ok: false } : {}) });
           if (error instanceof SyntaxError && ++parseFailures >= 3) peer.close(1008, 'Invalid messages');
           return;
         }
@@ -181,7 +186,7 @@ export async function startTransport(config: Config, dev: DevOptions, handlers: 
         void drain();
       });
       peers.set(ws, peer);
-      peer.send({ type: 'hello', serverVersion: '1.0.0', authDeadlineMs: config.limits.authDeadlineMs });
+      peer.send({ type: 'hello', serverVersion: '2.0.0', protocolVersion: 2, capabilities: ['resume', 'request_ids', 'idempotency', 'snapshots', 'matchmaking', 'parties', 'game_sessions'], authDeadlineMs: config.limits.authDeadlineMs });
       try { handlers.onConnect(peer); } catch { peer.close(1011, 'Connection handler failed'); }
     });
   });
@@ -194,8 +199,13 @@ export async function startTransport(config: Config, dev: DevOptions, handlers: 
   try { await listening.promise; } catch (error) { clearInterval(maintenance); wss.close(); throw error; }
   return {
     address() { return server.address() as AddressInfo; },
+    drain(deadline) {
+      stopping = true;
+      for (const peer of peers.values()) peer.send({ type: 'server_draining', deadline });
+    },
     async close() {
-      if (stopping) return;
+      if (closedTransport) return;
+      closedTransport = true;
       stopping = true;
       clearInterval(maintenance);
       for (const ws of peers.keys()) ws.terminate();
@@ -207,4 +217,14 @@ export async function startTransport(config: Config, dev: DevOptions, handlers: 
       counts.clear(); attempts.clear();
     },
   };
+}
+
+function messageRequestId(data: RawData): string | undefined {
+  // Only echo validated correlation metadata; never echo request bodies or credentials.
+  try {
+    const text = Array.isArray(data) ? Buffer.concat(data).toString('utf8') : Buffer.isBuffer(data) ? data.toString('utf8') : Buffer.from(data).toString('utf8');
+    const value: unknown = JSON.parse(text);
+    if (value && typeof value === 'object' && 'requestId' in value && typeof value.requestId === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/.test(value.requestId)) return value.requestId;
+  } catch { /* Malformed JSON has no reliable correlation identifier. */ }
+  return undefined;
 }
