@@ -12,6 +12,8 @@ export async function environment(t, overrides = {}, dependencies = {}) {
   config.server.listenPort = 0;
   config.db.path = join(dir, 'beacon.db');
   Object.assign(config.limits, { messageBurst: 1000, connectionBurst: 1000, maxConnectionsPerIp: 100 });
+  config.lobby.reconnectGraceMs = 0;
+  config.operations.drainTimeoutMs = 0;
   for (const [section, values] of Object.entries(overrides)) Object.assign(config[section], values);
   let service = await startBeacon(config, dev, dependencies);
   const clients = [];
@@ -26,7 +28,7 @@ export async function environment(t, overrides = {}, dependencies = {}) {
     await service.close();
     await rm(dir, { recursive: true, force: true });
   });
-  return { config, dir, connect, get service() { return service; }, async restart() { await service.close(); service = await startBeacon(config, dev); } };
+  return { config, dir, connect, get service() { return service; }, async restart() { await service.close(); service = await startBeacon(config, dev, dependencies); } };
 }
 
 export async function socket(url, options = {}) {

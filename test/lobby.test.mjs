@@ -65,17 +65,18 @@ test('restart retains rooms but not occupancy; first join changes durable host; 
   assert.equal((await select(carol)).total, 0);
 });
 
-test('latest authenticated connection replaces old session and releases its room slot', async t => {
-  const env = await environment(t);
+test('latest authenticated connection replaces transport and preserves its logical room seat', async t => {
+  const env = await environment(t, { lobby: { reconnectGraceMs: 30000 } });
   const old = await env.connect(); await select(old);
   const room = await create(old, { maxPlayers: 1 });
   const start = old.messages.length;
   const latest = await env.connect();
   assert.equal((await old.wait(message => message.type === 'error', start)).code, 'session_replaced');
-  await select(latest);
-  const joined = await latest.request({ type: 'join_room', roomId: room.id }, 'room_joined');
-  assert.equal(joined.room.playerCount, 1);
-  assert.equal(joined.members[0].isHost, true);
+  const resumed = await latest.wait(message => message.type === 'session_state');
+  assert.equal(resumed.room.id, room.id);
+  assert.equal(resumed.members[0].isHost, true);
+  assert.equal(resumed.room.playerCount, 1);
+  assert.equal((await latest.request({ type: 'join_room', roomId: room.id }, 'error')).code, 'already_in_room');
 });
 
 test('empty TTL applies after leave and restart; occupied rooms survive; removal pushes', async t => {
@@ -117,6 +118,14 @@ test('write failures return storage_error without changing creation, deletion, o
     insert(room) { if (failing) throw new Error('disk failure'); actual.insert(room); },
     setHost(...args) { if (failing) throw new Error('disk failure'); actual.setHost(...args); },
     delete(id) { if (failing) throw new Error('disk failure'); actual.delete(id); },
+    update(room) { if (failing) throw new Error('disk failure'); actual.update(room); },
+    listModeration() { return actual.listModeration(); },
+    saveModeration(record) { actual.saveModeration(record); },
+    listSocial() { return actual.listSocial(); },
+    saveSocial(link) { actual.saveSocial(link); },
+    deleteSocial(...args) { actual.deleteSocial(...args); },
+    audit(event) { actual.audit(event); },
+    listAudit(limit) { return actual.listAudit(limit); },
     close() { actual.close(); },
   };
   // The injected store is created lazily at load so environment owns its temporary directory.
@@ -163,7 +172,7 @@ test('disconnect during scrypt releases reservation; no ghost member or retained
 });
 
 test('room pagination is bounded by bytes and page size with no omissions or password leakage', async t => {
-  const env = await environment(t, { limits: { outboundBytes: 2048, defaultPageSize: 20, maxPageSize: 200 } });
+  const env = await environment(t, { lobby: { maxRoomsPerPlayer: 25 }, limits: { outboundBytes: 2048, defaultPageSize: 20, maxPageSize: 200 } });
   const alice = await env.connect(); await select(alice);
   const ids = [];
   for (let i = 0; i < 25; i++) { ids.push((await create(alice, { name: `${i}-` + '貓'.repeat(29) })).id); await alice.request({ type: 'leave_room' }, 'lobby_state'); }
@@ -180,7 +189,7 @@ test('room pagination is bounded by bytes and page size with no omissions or pas
   assert.deepEqual(received, ids);
 });
 
-test('password failures are bounded per connection and never consume room capacity', async t => {
+test('password failures are bounded per verified player and never consume room capacity', async t => {
   const env = await environment(t, { limits: { passwordFailures: 2 } });
   const alice = await env.connect(); const bob = await env.connect('dev-bob');
   await select(alice); await select(bob);
