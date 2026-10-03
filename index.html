@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Beacon.js：以 WSS、OAuth 與 SQLite 建構的遊戲分區大廳服務。">
+<title>Beacon.js — 遊戲大廳的訊號燈</title>
+<style>
+:root{color-scheme:dark;--bg:#101827;--panel:#18253b;--text:#edf3ff;--muted:#c0cde0;--accent:#8bdcfd}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:1.1rem/1.8 system-ui,sans-serif}main,footer,nav{max-width:70rem;margin:auto;padding:1.5rem}nav{display:flex;gap:1rem;justify-content:space-between;flex-wrap:wrap}a{color:var(--accent);text-underline-offset:.2em}a:focus-visible{outline:3px solid var(--accent);outline-offset:5px}.skip{position:absolute;top:-10rem}.skip:focus{top:0;background:var(--bg);padding:1rem}header{padding:3rem 0}h1{font-size:clamp(2.5rem,8vw,5rem);line-height:1.1;margin:.4em 0}h2{line-height:1.4}.lead{max-width:46rem;color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,17rem),1fr));gap:1rem}article,.note{padding:1.5rem;background:var(--panel);border-radius:1rem}article h3{margin-top:0}.tag{font-size:.95rem;color:var(--accent)}code{overflow-wrap:anywhere}footer{color:var(--muted);border-top:1px solid #364961}section{margin-bottom:3rem}
+</style>
+</head>
+<body>
+<a class="skip" href="#main">跳到主要內容</a>
+<nav aria-label="主要導覽"><strong>Beacon.js</strong><a href="https://github.com/JS-PACKAGE/Beacon.js">原始碼與文件</a></nav>
+<main id="main">
+<header><p class="tag">Node.js 26 · TypeScript · WSS</p><h1>遊戲大廳的訊號燈</h1><p class="lead">先驗證身分、選定遊戲，再找到一起玩的房間。Beacon.js 專注於安全的連線、房間管理與即時通知，讓遊戲系統各司其職。</p></header>
+<section aria-labelledby="features"><h2 id="features">一個清楚分工的大廳後端</h2><div class="grid"><article><h3>依遊戲找房間</h3><p>選遊戲後才進入大廳，房間清單與推播按遊戲隔離。</p></article><article><h3>密碼與人數上限</h3><p>房間密碼以 scrypt 雜湊保存；人數上限由遊戲 API 提供，加入操作避免超額競態。</p></article><article><h3>保留房間，不保留連線</h3><p>SQLite 保存房間資料；重啟後在線成員清空，玩家需要重新連線與驗證。</p></article></div></section>
+<section aria-labelledby="security"><h2 id="security">安全是架構的一部分</h2><p>對外使用 WSS，OAuth 經驗證 adapter 串接；搭配輸入驗證、配額、心跳、背壓與憑證遮蔽。介紹頁由 GitHub Pages 提供，與 WebSocket 服務分離。</p><p>Beacon.js 不提供帳號註冊、遊戲本體或前端大廳操作介面。</p></section>
+<section class="note" aria-labelledby="status"><h2 id="status">實作與上線是兩件事</h2><p>這是靜態介紹頁，不是可操作的大廳。真實 OAuth 與外部 WSS 部署必須取得實際端點和驗收證據；本頁不宣稱服務已上線或驗收通過。</p><p>開發者請閱讀倉庫的 README、AGENTS 與完整 PLAN。發布與部署由使用者明確操作。</p><a href="https://github.com/JS-PACKAGE/Beacon.js#readme">閱讀安裝、協定與部署指南</a></section>
+</main>
+<footer>Beacon.js · Apache-2.0 · 不追蹤訪客，不在此頁收集 token 或密碼。</footer>
+</body>
+</html>
