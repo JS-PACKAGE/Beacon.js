@@ -1,80 +1,225 @@
 import { pathToFileURL } from 'node:url';
 import type { AddressInfo } from 'node:net';
+import { setTimeout as delay } from 'node:timers/promises';
+import { monitorEventLoopDelay, performance } from 'node:perf_hooks';
 import { loadConfig, validateConfig } from './config.js';
 import type { Config, DevOptions } from './config.js';
 import { createAuthProvider } from './auth/index.js';
+import { RevocationRegistry } from './auth/revocations.js';
 import { GameRegistry } from './games/index.js';
 import { RoomManager } from './lobby/index.js';
 import { startTransport, markAuthenticated } from './net/index.js';
-import { ProtocolError, errorMessage } from './protocol/index.js';
+import type { Transport } from './net/index.js';
+import { PROTOCOL_VERSION, ProtocolError, errorMessage } from './protocol/index.js';
+import type { ClientMessage } from './protocol/index.js';
+import { RequestLedger } from './protocol/requests.js';
 import { SqliteRoomStore } from './store/index.js';
-import { log } from './log/index.js';
-import type { AuthProvider, GameProvider, RoomStore } from './types.js';
+import { log, configureLogging, closeLogging } from './log/index.js';
+import { startOperations } from './ops/index.js';
+import type { OperationsService } from './ops/index.js';
+import type { AuthProvider, GameProvider, GameSessionProvider, Peer, Player, Revocation, RoomStore } from './types.js';
 
 export interface BeaconService {
   address(): AddressInfo;
+  operationsAddress(): AddressInfo | undefined;
+  stats(): Record<string, unknown>;
   close(): Promise<void>;
 }
+interface Connection { raw: Peer; peer: Peer; player?: Player; reply?: (message: Record<string, unknown>) => void }
+function revoked(player: Player, records: readonly Revocation[]): boolean {
+  return records.some(record => (record.tokenId !== undefined && record.tokenId === player.tokenId) ||
+    (record.playerId === player.id && (record.revokedBefore === undefined || player.issuedAt === undefined || player.issuedAt <= record.revokedBefore)));
+}
 
-export async function startBeacon(config: Config, dev: DevOptions, overrides: { store?: RoomStore; auth?: AuthProvider; games?: GameProvider } = {}): Promise<BeaconService> {
+export async function startBeacon(config: Config, dev: DevOptions, overrides: { store?: RoomStore; auth?: AuthProvider; games?: GameProvider; sessions?: GameSessionProvider } = {}): Promise<BeaconService> {
   validateConfig(config, dev);
-  const store = overrides.store ?? new SqliteRoomStore(config.db.path);
+  await configureLogging(config.operations);
+  let store: RoomStore;
+  try { store = overrides.store ?? new SqliteRoomStore(config.db.path); }
+  catch (error) { await closeLogging(); throw error; }
+  let transport: Transport | undefined;
+  let operations: OperationsService | undefined;
+  let lobby: RoomManager | undefined;
+  const connections = new Map<string, Connection>();
+  const ledger = new RequestLedger(config);
+  const inFlight = new Set<Promise<void>>();
+  const eventLoop = monitorEventLoopDelay({ resolution: 20 });
+  eventLoop.enable();
+  let maintenance = false;
+  let closing: Promise<void> | undefined;
+  let revisionHealthy = !config.auth.revocationUrl;
+  let revocations: readonly Revocation[] = [];
+  let maintenanceJob: Promise<void> | undefined;
+  let revocationJob: Promise<void> | undefined;
+  let timer: NodeJS.Timeout | undefined;
+  let revocationTimer: NodeJS.Timeout | undefined;
   try {
     const games = overrides.games ?? new GameRegistry(config.games);
     await games.list();
     const auth = overrides.auth ?? createAuthProvider(config.auth);
-    const lobby = new RoomManager(config, store, games);
-    const transport = await startTransport(config, dev, {
-      onConnect(peer) { lobby.connect(peer); },
-      async onMessage(peer, message) {
-        try {
-          if (message.type === 'auth') {
-            let player;
-            try { player = await auth.verify(message.token); }
-            catch {
-              log('warn', 'authentication_failed');
-              peer.send({ type: 'auth_fail', code: 'auth_failed' });
-              peer.close(4003, 'Authentication failed');
-              return;
-            }
-            if (await lobby.authenticate(peer, player)) {
-              markAuthenticated(peer, player.expiresAt);
-              peer.send({ type: 'auth_ok', player: { id: player.id, displayName: player.displayName } });
-            }
-          } else {
-            await lobby.handle(peer, message);
-          }
-        } catch (error) {
-          const code = error instanceof ProtocolError ? error.code : 'server_error';
-          if (code === 'server_error') log('error', 'request_failed');
-          peer.send(errorMessage(code));
-          if (code === 'auth_expired') peer.close(4003, 'Authentication expired');
+    const manager = new RoomManager(config, store, games, overrides.sessions);
+    lobby = manager;
+    const registry = new RevocationRegistry(config.auth);
+    const refreshRevocations = async (): Promise<void> => {
+      try {
+        revocations = await registry.refresh();
+        await manager.enforceRevocations(revocations);
+        revisionHealthy = true;
+      } catch {
+        revisionHealthy = false;
+        operations?.metric('revocation_errors');
+        log('error', 'revocation_refresh_failed');
+        // Configured revocation authority is mandatory: do not retain unverified sessions.
+        for (const connection of connections.values()) connection.raw.close(4003, 'Authentication unavailable');
+      }
+    };
+    if (config.auth.revocationUrl) await refreshRevocations();
+    const stats = (): Record<string, unknown> => ({ ...manager.stats(), connections: connections.size, inFlight: inFlight.size, maintenance, revocationHealthy: revisionHealthy, eventLoopP99Ms: eventLoop.percentile(99) / 1e6, rssBytes: process.memoryUsage().rss });
+    const setMaintenance = (enabled: boolean): void => { maintenance = enabled; manager.setMaintenance(enabled); };
+    const dispatch = async (connection: Connection, message: ClientMessage): Promise<void> => {
+      const requestId = message.requestId;
+      const started = performance.now();
+      const direct = (value: Record<string, unknown>): void => connection.raw.send(requestId ? { ...value, requestId } : value);
+      if (connection.raw.closed) return;
+      try {
+        if (message.type !== 'auth') {
+          if (!connection.player) throw new ProtocolError('auth_required');
+          if (connection.player.expiresAt !== undefined && connection.player.expiresAt <= Date.now()) throw new ProtocolError('auth_expired');
+          if (!revisionHealthy || revoked(connection.player, revocations)) throw new ProtocolError('token_revoked');
         }
+        await ledger.execute(connection.player?.id ?? connection.raw.id, message, direct, async reply => {
+          connection.reply = reply;
+          try {
+            if (message.type === 'auth' || message.type === 'refresh_auth') {
+              if (maintenance || closing) throw new ProtocolError('maintenance');
+              if (!revisionHealthy) throw new ProtocolError('auth_failed');
+              if (message.type === 'auth' && connection.player) throw new ProtocolError('bad_request');
+              let player: Player;
+              try { player = await auth.verify(message.token); }
+              catch { throw new ProtocolError('auth_failed'); }
+              if (connection.raw.closed) return;
+              if (revoked(player, revocations)) throw new ProtocolError('token_revoked');
+              if (message.type === 'refresh_auth') {
+                if (player.id !== connection.player?.id) throw new ProtocolError('forbidden');
+                await manager.refreshAuthentication(connection.peer, player);
+              } else if (!(await manager.authenticate(connection.peer, player))) return;
+              connection.player = player;
+              markAuthenticated(connection.raw, player.expiresAt);
+              reply({ type: message.type === 'auth' ? 'auth_ok' : 'auth_refreshed', protocolVersion: PROTOCOL_VERSION, player: { id: player.id, displayName: player.displayName }, ...(player.expiresAt !== undefined ? { expiresAt: player.expiresAt } : {}) });
+              if (message.type === 'auth') await manager.handle(connection.peer, { type: 'sync_state' });
+            } else {
+              if ((maintenance || closing) && ['create_room', 'join_room', 'quick_join', 'queue_join', 'start_game', 'party_create', 'party_accept'].includes(message.type)) throw new ProtocolError('maintenance');
+              await manager.handle(connection.peer, message);
+            }
+            if (requestId) reply({ type: 'result', ok: true });
+            operations?.metric('requests_ok');
+          } catch (error) {
+            const code = error instanceof ProtocolError ? error.code : 'server_error';
+            if (code === 'server_error') log('error', 'request_failed');
+            reply({ ...errorMessage(code), ok: false });
+            operations?.metric(`errors_${code}`);
+            if (message.type === 'auth') {
+              reply({ type: 'auth_fail', code, ok: false });
+              connection.raw.close(4003, 'Authentication failed');
+            } else if (code === 'auth_expired' || code === 'token_revoked') connection.raw.close(4003, 'Authentication expired or revoked');
+          } finally { delete connection.reply; }
+        });
+      } catch (error) {
+        const code = error instanceof ProtocolError ? error.code : 'server_error';
+        direct({ ...errorMessage(code), ok: false });
+        if (code === 'auth_expired' || code === 'token_revoked') connection.raw.close(4003, 'Authentication expired or revoked');
+      }
+      finally {
+        operations?.metric('request_duration_ms', performance.now() - started);
+        operations?.metric('requests_total');
+      }
+    };
+    transport = await startTransport(config, dev, {
+      onConnect(raw) {
+        const connection: Connection = { raw, peer: {
+          id: raw.id, ip: raw.ip, get closed() { return raw.closed; },
+          send(message) { raw.send(message); }, close(code, reason) { raw.close(code, reason); },
+          reply(message) { if (connection.reply) connection.reply(message); else raw.send(message); },
+        } };
+        connections.set(raw.id, connection);
+        manager.connect(connection.peer);
+        operations?.metric('connections_opened');
       },
-      onClose(peer) { lobby.disconnect(peer); },
+      onMessage(raw, message) {
+        const connection = connections.get(raw.id);
+        if (!connection) return Promise.resolve();
+        const job = dispatch(connection, message);
+        inFlight.add(job);
+        void job.finally(() => inFlight.delete(job));
+        return job;
+      },
+      onClose(raw) {
+        const connection = connections.get(raw.id);
+        if (connection) manager.disconnect(connection.peer);
+        connections.delete(raw.id);
+        operations?.metric('connections_closed');
+      },
     });
-    let maintenanceRunning = false;
-    const timer = setInterval(() => {
-      if (maintenanceRunning) return;
-      maintenanceRunning = true;
-      void lobby.maintain().catch(() => log('error', 'maintenance_failed')).finally(() => { maintenanceRunning = false; });
+    operations = await startOperations(config, {
+      stats, ready: () => !maintenance && !closing && revisionHealthy && manager.stats().storageHealthy !== false,
+      ban: async (id, until, reason) => { await manager.banPlayer(id, until, reason); ledger.clearPlayer(id); },
+      unban: id => manager.unbanPlayer(id),
+      revoke: async (id, before) => { await manager.revokePlayer(id, before); ledger.clearPlayer(id); },
+      closeRoom: id => manager.closeRoomById(id),
+      maintenance: enabled => {
+        store.audit({ at: Date.now(), actor: 'operator', action: 'maintenance', target: String(enabled) });
+        setMaintenance(enabled);
+      },
+      audit: limit => store.listAudit(limit),
+    });
+    timer = setInterval(() => {
+      if (maintenanceJob || closing) return;
+      ledger.sweep();
+      maintenanceJob = manager.maintain().catch(() => { operations?.metric('maintenance_errors'); log('error', 'maintenance_failed'); }).finally(() => { maintenanceJob = undefined; });
     }, config.limits.maintenanceIntervalMs);
     timer.unref();
-    let closing: Promise<void> | undefined;
+    if (config.auth.revocationUrl) {
+      revocationTimer = setInterval(() => {
+        if (revocationJob || closing) return;
+        revocationJob = refreshRevocations().finally(() => { revocationJob = undefined; });
+      }, config.auth.revocationIntervalMs);
+      revocationTimer.unref();
+    }
+    const activeTransport = transport;
+    const activeOperations = operations;
     return {
-      address() { return transport.address(); },
+      address: () => activeTransport.address(), operationsAddress: () => activeOperations.address(), stats,
       close() {
         closing ??= (async () => {
           clearInterval(timer);
-          await transport.close();
-          await lobby.settle();
+          clearInterval(revocationTimer);
+          setMaintenance(true);
+          const deadline = Date.now() + config.operations.drainTimeoutMs;
+          activeTransport.drain(deadline);
+          if (connections.size && config.operations.drainTimeoutMs) await delay(config.operations.drainTimeoutMs);
+          await activeTransport.close();
+          await Promise.allSettled([...inFlight]);
+          await Promise.allSettled([...(maintenanceJob ? [maintenanceJob] : []), ...(revocationJob ? [revocationJob] : [])]);
+          await manager.close();
+          await manager.settle();
+          await activeOperations.close();
+          ledger.clear();
           store.close();
+          eventLoop.disable();
+          await closeLogging();
         })();
         return closing;
       },
     };
   } catch (error) {
+    clearInterval(timer);
+    clearInterval(revocationTimer);
+    await transport?.close();
+    await lobby?.close();
+    await operations?.close();
     store.close();
+    eventLoop.disable();
+    await closeLogging();
     throw error;
   }
 }
@@ -104,10 +249,8 @@ async function main(): Promise<void> {
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
 }
-
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   void main().catch(error => {
-    // Startup errors are generated locally, never provider response bodies or credentials.
     console.error(error instanceof Error ? error.message : 'Beacon.js startup failed');
     process.exitCode = 1;
   });
