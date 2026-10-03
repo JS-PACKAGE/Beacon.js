@@ -1,0 +1,65 @@
+# Beacon.js 部署設定唯一來源。採 YAML 1.2 flow 格式（雙引號鍵名、逗號分隔），支援 # 註解。
+# 改設定後需重啟。不要把正式 token、房間密碼或私鑰內容放在此檔案。
+{
+  "server": { # 本機監聽、代理信任與來源檢查
+    "listenHost": "127.0.0.1", # 只允許 loopback，禁止直接暴露於外網
+    "listenPort": 34568, # Cloudflare Tunnel 轉送至此本機埠
+    "trustProxy": true, # 僅受信任代理可提供來源 IP 與 TLS 轉送資訊
+    "trustedProxyAddresses": ["127.0.0.1", "::1"], # 允許提供轉送標頭的代理位址
+    "allowedOrigins": [], # 瀏覽器 Origin 白名單；空陣列表示拒絕所有帶 Origin 的客戶端
+    "allowNoOrigin": true # 允許沒有 Origin 的 CLI／原生遊戲客戶端
+  },
+  "public": { # 對外 WSS 位址與 TLS 終結方式
+    "domain": "lobby.ysgs.app", # 正式連線的 Host；此網域不提供一般網頁
+    "tls": "proxy", # proxy：Cloudflare 終結 TLS；direct：本程序載入憑證
+    "certPath": "", # direct 模式的 PEM 憑證檔案路徑
+    "keyPath": "" # direct 模式的 PEM 私鑰檔案路徑，勿提交私鑰
+  },
+  "auth": { # OAuth 驗證 adapter，不儲存帳號密碼
+    "mode": "mock", # mock 僅開發旗標可啟動；正式改成 jwks 或 remote
+    "jwksUrl": "", # jwks 模式：驗證系統的 HTTPS JWKS 端點
+    "issuer": "", # JWT iss 必須精確符合此值
+    "audience": "", # JWT aud 必須包含此值
+    "apiUrl": "", # remote 模式：驗證 API 基底網址，會 POST /v1/verify
+    "timeoutMs": 5000, # 驗證 API 呼叫逾時，毫秒；失敗一律拒絕登入
+    "jwksCacheTtlSec": 300, # JWKS 公鑰快取有效秒數
+    "mockPlayers": [ # 僅供本機測試的固定 token 與身分，非正式憑證
+      { "token": "dev-alice", "id": "alice", "displayName": "Alice" },
+      { "token": "dev-bob", "id": "bob", "displayName": "Bob" },
+      { "token": "dev-carol", "id": "carol", "displayName": "Carol" }
+    ]
+  },
+  "games": { # 遊戲伺服器清單 adapter
+    "apiUrl": "", # HTTPS API 基底網址，會 GET /v1/games；空值採設定備援
+    "timeoutMs": 5000, # 遊戲 API 呼叫逾時，毫秒
+    "cacheTtlSec": 60, # 遊戲清單快取有效秒數
+    "fallback": [ # API 不可達時的啟動備援，正式環境須換成實際遊戲
+      { "gameId": "g-001", "name": "Demo game", "maxPlayersPerRoom": 8, "enabled": true },
+      { "gameId": "g-002", "name": "Second game", "maxPlayersPerRoom": 4, "enabled": true }
+    ]
+  },
+  "room": { "emptyTtlSec": 1800 }, # 空房保留秒數，0＝永不自動清除；重啟後重新計時
+  "db": { "path": "data/beacon.db" }, # SQLite 房間資料檔，0600 權限、WAL 模式
+  "limits": { # 所有資源與協定配額；調整後需重啟
+    "authDeadlineMs": 10000, # 連線後須完成驗證的期限，毫秒
+    "heartbeatIntervalMs": 30000, # WebSocket ping 間隔，毫秒
+    "heartbeatTimeoutMs": 60000, # 未收到 pong 的斷線門檻，毫秒
+    "maxConnectionsPerIp": 10, # 單一來源 IP 同時連線上限
+    "maxConnections": 5000, # 全服務同時連線上限
+    "connectionBurst": 5, # 每 IP 新連線 token bucket 容量
+    "connectionWindowMs": 10000, # 新連線配額完整補充所需毫秒
+    "messageBurst": 20, # 每連線訊息 token bucket 容量
+    "messageWindowMs": 10000, # 訊息配額完整補充所需毫秒
+    "maxRateViolations": 3, # 連續超過訊息配額幾次後斷線
+    "passwordFailures": 5, # 每連線每個時間窗允許的錯誤密碼次數
+    "passwordWindowMs": 60000, # 密碼猜測失敗計數時間窗，毫秒
+    "maxRoomsPerGame": 1000, # 每個遊戲可持有的房間數量上限
+    "inboundBytes": 4096, # 入站單則訊息上限，bytes；超限斷線
+    "outboundBytes": 65536, # 出站單則上限，bytes；列表分頁、成員拆包，不截斷
+    "maxBufferedBytes": 262144, # socket 傳送積壓上限，超過踢除慢速連線
+    "socketHighWaterMark": 65536, # HTTP(S) socket 串流背壓高水位，bytes
+    "defaultPageSize": 50, # 房間列表每頁預設數量，頁碼從 1 開始
+    "maxPageSize": 200, # 客戶端可要求的每頁房間數量上限
+    "maintenanceIntervalMs": 1000 # 空房 TTL 清理掃描間隔，毫秒
+  }
+}
