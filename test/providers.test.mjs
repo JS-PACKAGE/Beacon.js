@@ -5,6 +5,12 @@ import { generateKeyPairSync, sign } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { AuthError, MockAuthProvider, RemoteVerifyProvider, JwksProvider, createAuthProvider } from '../dist/auth/index.js';
 import { GameRegistry } from '../dist/games/index.js';
+import { HttpGameSessions } from '../dist/games/sessions.js';
+import { RevocationRegistry } from '../dist/auth/revocations.js';
+import { readSecretFile } from '../dist/auth/secrets.js';
+import { mkdtemp, writeFile, chmod, symlink, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 const config = {
   mode: 'jwks', jwksUrl: '', issuer: 'https://issuer.example', audience: 'beacon', apiUrl: '',
@@ -173,4 +179,107 @@ test('games uses config fallback on malformed/oversized API and validates identi
   const empty = new GameRegistry({ apiUrl: 'http://127.0.0.1:0', timeoutMs: 30, cacheTtlSec: 60, fallback: [] });
   assert.deepEqual(await empty.list(), []);
   assert.throws(() => new GameRegistry({ apiUrl: '', timeoutMs: 500, cacheTtlSec: 60, fallback: [{ ...remoteGame, name: '\n' }] }));
+});
+
+test('game sessions perform real bounded lifecycle with idempotency and bearer credentials', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'beacon-provider-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const tokenFile = join(dir, 'token');
+  await writeFile(tokenFile, 'private-service-token\n', { mode: 0o600 });
+  const seen = [];
+  const expiresAt = Date.now() + 60000;
+  const url = await http(t, async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    seen.push({ method: req.method, url: req.url, authorization: req.headers.authorization, key: req.headers['idempotency-key'], body: Buffer.concat(chunks).toString() });
+    if (req.method === 'DELETE') { res.writeHead(204); res.end(); }
+    else if (req.url.endsWith('/admissions')) reply(res, { serverUrl: 'wss://game.example/play', ticket: 'admitted', expiresAt }, 201);
+    else if (req.method === 'GET') reply(res, { state: 'in_game' });
+    else reply(res, { matchId: 'match/one', serverUrl: 'wss://game.example/play', expiresAt, tickets: { alice: 'alice-ticket' } }, 201);
+  });
+  const provider = new HttpGameSessions({ sessionApiUrl: url + '/base', serviceTokenFile: tokenFile, timeoutMs: 500 });
+  const allocated = await provider.create({ operationId: 'op-one', roomId: 'room', gameId: 'game', players: [{ id: 'alice', role: 'player' }], version: '1', mode: '', region: '' });
+  assert.equal(allocated.tickets.alice, 'alice-ticket');
+  assert.equal((await provider.admit(allocated.matchId, 'bob', 'spectator')).ticket, 'admitted');
+  assert.equal(await provider.status(allocated.matchId), 'in_game');
+  await provider.cancel(allocated.matchId);
+  assert.deepEqual(seen.map(r => [r.method, r.url]), [['POST', '/base/v1/matches'], ['POST', '/base/v1/matches/match%2Fone/admissions'], ['GET', '/base/v1/matches/match%2Fone'], ['DELETE', '/base/v1/matches/match%2Fone']]);
+  assert.ok(seen.every(r => r.authorization === 'Bearer private-service-token'));
+  assert.equal(seen[0].key, 'op-one');
+  assert.deepEqual(JSON.parse(seen[1].body), { playerId: 'bob', role: 'spectator' });
+  await assert.rejects(new HttpGameSessions({ sessionApiUrl: '', serviceTokenFile: '', timeoutMs: 50 }).status('match'), error => error.code === 'game_service_unavailable');
+});
+
+test('revocation registry rejects malformed/oversized/unreachable data and retains verified JWT revocation claims', async t => {
+  let body = [{ playerId: 'alice', revokedBefore: 123 }, { tokenId: 'jti' }];
+  const url = await http(t, (_req, res) => reply(res, body));
+  const registry = new RevocationRegistry({ ...config, revocationUrl: url });
+  assert.deepEqual(await registry.refresh(), body);
+  for (const invalid of [[{}], [{ playerId: 'alice', revokedBefore: -1 }], [{ tokenId: 'jti', revokedBefore: 1 }], [{ playerId: 'a', extra: true }], Array(4097).fill({ playerId: 'a' })]) {
+    body = invalid;
+    await assert.rejects(registry.refresh(), /revocation service unavailable/);
+  }
+  await assert.rejects(new RevocationRegistry({ ...config, revocationUrl: 'http://127.0.0.1:0' }).refresh());
+  const jwksUrl = await http(t, (_req, res) => reply(res, { keys: [jwk(key1, 'one')] }));
+  const issuedAt = Math.floor(Date.now() / 1000) - 1;
+  const player = await new JwksProvider({ ...config, jwksUrl }).verify(jwt({ jti: 'verified-jti', iat: issuedAt }));
+  assert.equal(player.tokenId, 'verified-jti');
+  assert.equal(player.issuedAt, issuedAt * 1000);
+});
+
+test('service secret reader rejects permissive files, symlinks and oversized secrets', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'beacon-secret-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'token');
+  await writeFile(path, 'secret', { mode: 0o600 });
+  assert.equal(readSecretFile(path), 'secret');
+  await chmod(path, 0o644);
+  assert.throws(() => readSecretFile(path), /Invalid private token file/);
+  await chmod(path, 0o600);
+  const link = join(dir, 'link');
+  await symlink(path, link);
+  assert.throws(() => readSecretFile(link));
+  await writeFile(path, 'a'.repeat(8193));
+  assert.throws(() => readSecretFile(path));
+});
+
+test('game lifecycle rejects invalid allocations/states, redirect leakage, slow and oversized responses', async t => {
+  let behavior = 'state';
+  const url = await http(t, (_req, res) => {
+    if (behavior === 'slow') return;
+    if (behavior === 'redirect') { res.writeHead(302, { location: 'https://elsewhere.example' }); res.end(); return; }
+    if (behavior === 'large') { res.end('x'.repeat(262145)); return; }
+    reply(res, behavior === 'state' ? { state: 'invented' } : { matchId: 'match', serverUrl: 'wss://game.example', expiresAt: Date.now() + 1000, tickets: {} });
+  });
+  const provider = new HttpGameSessions({ sessionApiUrl: url, serviceTokenFile: '', timeoutMs: 30 });
+  for (behavior of ['state', 'redirect', 'large', 'slow']) await assert.rejects(provider.status('match'), error => error.code === 'game_service_unavailable' && !error.message.includes('elsewhere'));
+  behavior = 'allocation';
+  await assert.rejects(provider.create({ operationId: 'op', roomId: 'r', gameId: 'g', players: [{ id: 'alice', role: 'player' }], version: '', mode: '', region: '' }));
+});
+
+test('game compatibility arrays are bounded, immutable and independent of source objects', async () => {
+  const versions = ['1'];
+  const provider = new GameRegistry({ apiUrl: '', fallback: [{ ...remoteGame, versions, modes: ['ranked'], regions: ['apac'] }] });
+  versions.push('2');
+  const game = (await provider.list())[0];
+  assert.deepEqual(game.versions, ['1']);
+  assert.throws(() => game.versions.push('2'), TypeError);
+  for (const versions of [Array(33).fill('v'), ['x'.repeat(65)], ['bad\nvalue']]) assert.throws(() => new GameRegistry({ apiUrl: '', fallback: [{ ...remoteGame, versions }] }));
+});
+
+test('game allocation capacity is bounded by actual request bytes rather than an arbitrary player count', async t => {
+  let calls = 0;
+  const url = await http(t, async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString());
+    calls++;
+    reply(res, { matchId: 'large-match', serverUrl: 'wss://game.example', expiresAt: Date.now() + 60000, tickets: Object.fromEntries(body.players.map(player => [player.id, 'ticket'])) });
+  });
+  const provider = new HttpGameSessions({ sessionApiUrl: url, serviceTokenFile: '', timeoutMs: 500 });
+  const input = { operationId: 'op', roomId: 'r', gameId: 'g', players: Array.from({ length: 1025 }, (_, i) => ({ id: `p${i}`, role: 'player' })), version: '', mode: '', region: '' };
+  assert.equal(Object.keys((await provider.create(input)).tickets).length, 1025);
+  assert.equal(calls, 1);
+  await assert.rejects(provider.create({ ...input, players: Array.from({ length: 3000 }, (_, i) => ({ id: `p${i}-${'x'.repeat(110)}`, role: 'player' })) }));
+  assert.equal(calls, 1);
 });

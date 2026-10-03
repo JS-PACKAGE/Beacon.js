@@ -8,11 +8,20 @@ export function apiEndpoint(base: string, path: string): string {
   return url.href;
 }
 
+export interface JsonRequestOptions {
+  method?: 'GET' | 'POST' | 'DELETE';
+  headers?: Readonly<Record<string, string>>;
+  body?: unknown;
+  statuses?: readonly number[];
+  empty?: boolean;
+}
 // One connection per request avoids idle pooled-socket reuse; the deadline covers the complete body.
-export async function requestJson(url: string, timeoutMs: number, maxBytes: number, token?: string): Promise<unknown> {
+export async function requestJson(url: string, timeoutMs: number, maxBytes: number, token?: string, options: JsonRequestOptions = {}): Promise<unknown> {
   try {
     const endpoint = new URL(url);
     if (!['http:', 'https:'].includes(endpoint.protocol) || endpoint.username || endpoint.password) throw new Error('External API request failed');
+    const body = options.body === undefined ? undefined : JSON.stringify(options.body);
+    if (body !== undefined && Buffer.byteLength(body) > maxBytes) throw new Error();
     return await new Promise<unknown>((resolve, reject) => {
       let settled = false;
       let response: IncomingMessage | undefined;
@@ -20,8 +29,8 @@ export async function requestJson(url: string, timeoutMs: number, maxBytes: numb
       const transport = endpoint.protocol === 'https:' ? httpsRequest : httpRequest;
       const request = transport(endpoint, {
         agent: false,
-        method: token === undefined ? 'GET' : 'POST',
-        headers: token === undefined ? { accept: 'application/json' } : { accept: 'application/json', authorization: `Bearer ${token}` },
+        method: options.method ?? (token === undefined ? 'GET' : 'POST'),
+        headers: { accept: 'application/json', ...options.headers, ...(token === undefined ? {} : { authorization: `Bearer ${token}` }), ...(body === undefined ? {} : { 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(body)) }) },
       });
       const fail = (): void => {
         if (settled) return;
@@ -39,7 +48,7 @@ export async function requestJson(url: string, timeoutMs: number, maxBytes: numb
         incoming.on('aborted', fail);
         const length = incoming.headers['content-length'];
         // No redirects are followed, so bearer credentials never reach another endpoint.
-        if (incoming.statusCode !== 200 || (length !== undefined && (!/^\d+$/.test(length) || Number(length) > maxBytes))) {
+        if (!(options.statuses ?? [200]).includes(incoming.statusCode ?? 0) || (length !== undefined && (!/^\d+$/.test(length) || Number(length) > maxBytes))) {
           fail(); return;
         }
         const chunks: Buffer[] = [];
@@ -54,7 +63,7 @@ export async function requestJson(url: string, timeoutMs: number, maxBytes: numb
           if (settled) return;
           if (!incoming.complete) { fail(); return; }
           try {
-            const value = JSON.parse(Buffer.concat(chunks, bytes).toString('utf8')) as unknown;
+            const value = options.empty && bytes === 0 ? undefined : JSON.parse(Buffer.concat(chunks, bytes).toString('utf8')) as unknown;
             settled = true;
             clearTimeout(timer);
             resolve(value);
@@ -63,7 +72,7 @@ export async function requestJson(url: string, timeoutMs: number, maxBytes: numb
         incoming.on('close', () => { if (!settled) fail(); });
       });
       timer = setTimeout(fail, timeoutMs);
-      request.end();
+      request.end(body);
     });
   } catch { throw new Error('External API request failed'); }
 }

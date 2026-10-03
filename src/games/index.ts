@@ -19,6 +19,11 @@ function games(value: unknown, source: Game['source']): readonly Game[] {
       if (!boundedText(item.serverHint, 1024)) throw new Error('Invalid game registry');
       result.serverHint = item.serverHint;
     }
+    for (const key of ['versions', 'modes', 'regions'] as const) if (item[key] !== undefined) {
+      const values = item[key];
+      if (!Array.isArray(values) || values.length > 32 || !values.every(v => boundedText(v, 64))) throw new Error('Invalid game registry');
+      result[key] = Object.freeze([...values]) as readonly string[];
+    }
     return Object.freeze(result);
   }));
 }

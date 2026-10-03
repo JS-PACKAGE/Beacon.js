@@ -46,7 +46,17 @@ export class RemoteVerifyProvider implements AuthProvider {
     try {
       validToken(token);
       const result = object(await requestJson(apiEndpoint(this.config.apiUrl, '/v1/verify'), this.config.timeoutMs, 16_384, token));
-      return identity(result.playerId, result.displayName);
+      const player = identity(result.playerId, result.displayName);
+      if (result.tokenId !== undefined) {
+        if (!text(result.tokenId, 128)) throw new AuthError();
+        player.tokenId = result.tokenId;
+      }
+      for (const field of ['issuedAt', 'expiresAt'] as const) if (result[field] !== undefined) {
+        const timestamp = result[field];
+        if (typeof timestamp !== 'number' || !Number.isSafeInteger(timestamp) || timestamp < 0 || (field === 'expiresAt' && timestamp <= player.authAt) || (field === 'issuedAt' && timestamp > player.authAt)) throw new AuthError();
+        player[field] = timestamp;
+      }
+      return player;
     } catch { throw new AuthError(); }
   }
 }
@@ -125,6 +135,14 @@ export class JwksProvider implements AuthProvider {
       if (audience !== this.config.audience && !(Array.isArray(audience) && audience.length > 0 && audience.length <= 16 && audience.every(a => text(a, 256)) && audience.includes(this.config.audience))) throw new AuthError();
       const player = identity(claims.sub, claims.name);
       player.expiresAt = claims.exp * 1000;
+      if (claims.jti !== undefined) {
+        if (!text(claims.jti, 128)) throw new AuthError();
+        player.tokenId = claims.jti;
+      }
+      if (claims.iat !== undefined) {
+        if (typeof claims.iat !== 'number' || !Number.isSafeInteger(claims.iat) || claims.iat < 0 || claims.iat > now || !Number.isSafeInteger(claims.iat * 1000)) throw new AuthError();
+        player.issuedAt = claims.iat * 1000;
+      }
       if (player.expiresAt <= player.authAt) throw new AuthError();
       return player;
     } catch { throw new AuthError(); }
