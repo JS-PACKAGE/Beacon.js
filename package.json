@@ -1,11 +1,17 @@
 {
   "name": "@js-package/beacon",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "description": "OAuth-authenticated WSS game lobby with durable SQLite rooms",
   "type": "module",
   "engines": {
     "node": ">=26"
+  },
+  "exports": {
+    "./client": {
+      "types": "./dist/client/index.d.ts",
+      "import": "./dist/client/index.js"
+    }
   },
   "scripts": {
     "build": "tsc",
@@ -14,6 +20,8 @@
     "dev": "npm run build && node dist/main.js --dev-mock-auth --dev-insecure-ws",
     "test": "npm run build && node --test test/*.test.mjs",
     "backup": "node dist/store/backup.js",
+    "restore:drill": "npm run build && node scripts/restore-drill.mjs",
+    "load": "npm run build && node scripts/load.mjs",
     "verify": "npm run typecheck && npm test && npm audit --omit=dev"
   },
   "license": "Apache-2.0",
