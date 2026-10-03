@@ -25,6 +25,8 @@ npm run dev
 
 package.json 指令：`build` = tsc；`typecheck` = tsc --noEmit；`start` = node dist/main.js；`test` = 建置後 node:test；`backup` = node dist/store/backup.js；`verify` = typecheck、test、npm audit --omit=dev。這份文件不是測試已通過的證明。
 
+CI 使用 Node.js **24／26** × **macOS 26（arm64）、Ubuntu 24.04 LTS／26.04 LTS（各含 x64 與 arm64）**，共十組；每組執行 npm ci、typecheck、完整測試、部署工具安全測試與 runtime dependencies audit，單組失敗不取消其他組。Runner 標籤固定為 `macos-26`（本身即 arm64）、`ubuntu-24.04`、`ubuntu-24.04-arm`、`ubuntu-26.04`、`ubuntu-26.04-arm`（[官方可用映像](https://github.com/actions/runner-images#available-images)）。Node.js 24 僅作相容性回歸測試，**不改變正式啟動與部署要求的 Node.js ≥26**；npm 在 Node.js 24 顯示的專案 engine 警告屬預期。
+
 ## 設定與正式啟動
 
 **根目錄 `config.yaml` 為唯一部署設定真值**。為避免新增 YAML 解析依賴，檔案只接受 **YAML 1.2 flow-style JSON 結構加 `#` 中文註解**：雙引號 key、花括號與逗號結構；引號外 `#` 至行尾為註解，引號內 `#` 保留。不支援一般 block YAML 縮排語法。所有必要欄位與配額已列於該檔，必須保留完整結構；不以環境變數覆蓋設定。`node dist/main.js --config /absolute/path/config.yaml` 可選擇另一份完整設定。相對路徑以執行工作目錄為基準。工具請呼叫 loadConfig，不可直接 JSON.parse 原始檔。
