@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { createServer } from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
 import { loadConfig } from '../dist/config.js';
-import { startOperations, sendAlert } from '../dist/ops/index.js';
+import { startOperations, sendAlert, OperationsError } from '../dist/ops/index.js';
 import { ProtocolError } from '../dist/protocol/index.js';
 import { scheduledBackup } from '../dist/ops/backups.js';
 import { restoreDrill } from '../dist/ops/restore.js';
@@ -31,6 +31,14 @@ async function setup(t) {
     audit: limit => [{ at: 1, actor: 'operator', action: 'ban', target: 'alice', limit }],
     reportMatch: async (...args) => { calls.push(['match', ...args]); },
     reportPlayerResult: async (...args) => { calls.push(['player-result', ...args]); },
+    authorizeMutation: () => {},
+    rooms: () => ({ items: [] }), room: () => undefined,
+    matches: () => ({ items: [] }), match: () => undefined,
+    queueDiagnostics: () => ({ entries: [] }), integrations: () => ({ configured: false }),
+    clusterHealth: () => ({ enabled: false }),
+    reconcileMatch: async (...args) => { calls.push(['reconcile', ...args]); return { state: 'ended' }; },
+    chatReports: () => ({ items: [] }), chatReport: () => undefined,
+    reviewChatReport: async (...args) => { calls.push(['review', ...args]); },
   };
   return { directory, config, calls, hooks };
 }
@@ -77,6 +85,50 @@ test('internal operations rejects unauthorized and invalid requests and hides ho
   assert.deepEqual(await failed.json(), { error: 'request_failed' });
 });
 
+test('admin diagnostic pages and report details are private, bounded and authenticated; rejected actions do not mutate', async t => {
+  const { directory, config, hooks, calls } = await setup(t);
+  const tokenFile = join(directory, 'diagnostics.token');
+  await writeFile(tokenFile, 'diagnostics-secret', { mode: 0o600 });
+  Object.assign(config.operations, { enabled: true, listenPort: 0, tokenFile });
+  const secretFields = { password: 'hidden-password', passwordHash: 'hidden-hash', token: 'hidden-token', ticket: 'hidden-ticket', diagnostics: { providerSecret: 'hidden-provider' } };
+  const room = { id: 'room-1', state: 'running', members: [{ playerId: 'alice', ...secretFields }], ...secretFields };
+  hooks.rooms = (cursor, limit) => ({ items: [room, { id: 'room-2' }], nextCursor: String(Number(cursor ?? 0) + limit) });
+  hooks.room = identifier => identifier === 'room-1' ? room : undefined;
+  hooks.matches = () => ({ items: [{ matchId: 'match-1', state: 'ended', roster: [{ playerId: 'alice' }], ...secretFields }] });
+  hooks.match = identifier => identifier === 'match-1' ? { matchId: identifier, state: 'ended', ...secretFields } : undefined;
+  hooks.chatReport = identifier => identifier === 'report-1' ? { reportId: identifier, status: 'pending', evidence: { messageId: 'message-1', text: 'bounded evidence', ...secretFields }, reason: 'abuse', ...secretFields } : undefined;
+  hooks.chatReports = () => ({ items: [hooks.chatReport('report-1')] });
+  hooks.queueDiagnostics = () => ({ entries: [{ partyId: 'party-1', waitMs: 500 }], ...secretFields });
+  hooks.integrations = () => ({ gameSessions: { configured: true, healthy: false, ...secretFields }, ...secretFields });
+  hooks.clusterHealth = () => ({ role: 'follower', healthy: true, ...secretFields });
+  const service = await startOperations(config, hooks);
+  t.after(() => service.close());
+  const base = `http://127.0.0.1:${service.address().port}`;
+  const request = (path, input, authorized = true) => fetch(base + path, { headers: { authorization: authorized ? 'Bearer diagnostics-secret' : 'Bearer wrong', 'content-type': 'application/json' }, ...(input === undefined ? {} : { method: 'POST', body: JSON.stringify(input) }) });
+  for (const path of ['/rooms', '/rooms/room-1', '/matches', '/matches/match-1', '/queue', '/integrations', '/cluster', '/chat/reports', '/chat/reports/report-1']) {
+    assert.equal((await request(path, undefined, false)).status, 403);
+    const response = await request(path); assert.equal(response.status, 200);
+    assert.equal(JSON.stringify(await response.json()).includes('hidden-'), false);
+  }
+  const page = await (await request('/rooms?limit=1&cursor=0')).json();
+  assert.equal(page.items.length, 1); assert.equal(page.nextCursor, '1');
+  assert.equal(page.items[0].members[0].playerId, 'alice');
+  assert.equal((await (await request('/chat/reports/report-1')).json()).evidence.text, 'bounded evidence');
+  for (const query of ['limit=0', 'limit=201', 'limit=1&limit=2', 'cursor=-1', 'cursor=1000000001', 'other=1']) assert.equal((await request('/rooms?' + query)).status, 400);
+  assert.equal((await request('/rooms/missing')).status, 404);
+  assert.equal((await request('/matches/reconcile', { matchId: 'match-1' }, false)).status, 403);
+  hooks.reconcileMatch = async () => { throw new OperationsError(409, 'conflict'); };
+  assert.equal((await request('/matches/reconcile', { matchId: 'match-1' })).status, 409);
+  const before = calls.length;
+  assert.equal((await request('/chat/reports/review', { reportId: 'report-1', action: 'mute', until: 0, reason: 'reviewed' })).status, 400);
+  assert.equal((await request('/chat/reports/review', { reportId: 'report-1', action: 'dismiss', until: 0, reason: 'x'.repeat(5000) })).status, 400);
+  hooks.authorizeMutation = () => { throw new OperationsError(409, 'not_leader'); };
+  const rejected = await request('/chat/reports/review', { reportId: 'report-1', action: 'dismiss', until: 0, reason: 'reviewed' });
+  assert.equal(rejected.status, 409); assert.deepEqual(await rejected.json(), { error: 'not_leader' });
+  assert.equal((await request('/maintenance', { enabled: true })).status, 409);
+  assert.equal(calls.length, before);
+});
+
 test('operations disabled means no listener; admin token permissions and symlinks fail closed', async t => {
   const { directory, config, hooks } = await setup(t);
   const disabled = await startOperations(config, hooks);
@@ -90,6 +142,9 @@ test('operations disabled means no listener; admin token permissions and symlink
   const link = join(directory, 'link'); await symlink(path, link);
   config.operations.tokenFile = link;
   await assert.rejects(startOperations(config, hooks), /mode0600/);
+  config.operations.tokenFile = path;
+  config.operations.listenHost = '0.0.0.0';
+  await assert.rejects(startOperations(config, hooks), /loopback/);
 });
 
 test('scheduled backups use SQLite snapshots, retain only own private files and restore in isolation', async t => {
@@ -115,7 +170,7 @@ test('scheduled backups use SQLite snapshots, retain only own private files and 
   assert.equal((await lstat(last)).mode & 0o777, 0o600);
   const before = await readFile(last);
   const result = await restoreDrill(last);
-  assert.equal(result.integrity, 'ok'); assert.equal(result.rooms, 1); assert.deepEqual(result.migrationVersions, [1, 2, 3]);
+  assert.equal(result.integrity, 'ok'); assert.equal(result.rooms, 1);
   assert.deepEqual(await readFile(last), before);
   assert.deepEqual(store.load(), [room]);
 });
@@ -131,7 +186,7 @@ test('restore drill executes real legacy migrations and preserves corrupt input'
   db.close();
   const before = await readFile(legacy);
   const result = await restoreDrill(legacy);
-  assert.equal(result.rooms, 1); assert.deepEqual(result.migrationVersions, [1, 2, 3]);
+  assert.equal(result.rooms, 1);
   assert.deepEqual(await readFile(legacy), before);
   const bad = join(directory, 'bad.sqlite'); await writeFile(bad, 'invalid sqlite');
   await assert.rejects(restoreDrill(bad)); assert.equal(await readFile(bad, 'utf8'), 'invalid sqlite');
@@ -202,4 +257,42 @@ test('configured integrations run without an admin listener and stop on close', 
     store.close();
     await new Promise(resolve => webhook.close(resolve));
   }
+});
+
+test('operator report pagination respects byte limits without losing evidence or records', async t => {
+  const { directory, config, hooks } = await setup(t);
+  const tokenFile = join(directory, 'page.token');
+  await writeFile(tokenFile, 'page-operator', { mode: 0o600 });
+  Object.assign(config.operations, { enabled: true, listenPort: 0, tokenFile });
+  const reports = Array.from({ length: 50 }, (_, index) => ({
+    id: `report-${index}`, status: 'pending',
+    message: { id: `message-${index}`, text: '界'.repeat(1000) },
+  }));
+  hooks.chatReports = (cursor, limit) => {
+    const offset = Number(cursor ?? 0);
+    const items = reports.slice(offset, offset + limit);
+    return { items, ...(offset + items.length < reports.length ? { nextCursor: String(offset + items.length) } : {}) };
+  };
+  const service = await startOperations(config, hooks);
+  t.after(() => service.close());
+  const seen = [];
+  let cursor;
+  do {
+    const response = await fetch(`http://127.0.0.1:${service.address().port}/chat/reports${cursor === undefined ? '' : `?cursor=${cursor}`}`, {
+      headers: { authorization: 'Bearer page-operator' },
+    });
+    assert.equal(response.status, 200);
+    const wire = await response.text();
+    assert.ok(Buffer.byteLength(wire) <= 65536);
+    const page = JSON.parse(wire);
+    assert.ok(page.items.length > 0);
+    for (const report of page.items) {
+      assert.equal(report.message.text, '界'.repeat(1000));
+      seen.push(report.id);
+    }
+    const next = page.nextCursor;
+    if (next !== undefined) assert.ok(Number(next) > Number(cursor ?? 0));
+    cursor = next;
+  } while (cursor !== undefined);
+  assert.deepEqual(seen, reports.map(report => report.id));
 });

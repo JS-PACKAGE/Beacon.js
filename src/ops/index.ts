@@ -1,14 +1,21 @@
 import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
-import { ProtocolError } from '../protocol/index.js';
-import { readRules } from '../protocol/index.js';
+import { ERROR_MESSAGES, ProtocolError, readRules } from '../protocol/index.js';
 import { lstatSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import type { Config } from '../config.js';
 import { readSecretFile } from '../auth/secrets.js';
 import { log } from '../log/index.js';
 import { scheduledBackup } from './backups.js';
+import { pagination, projectDiagnostic, projectPage, type OperationsPage } from './diagnostics.js';
+const metricNames: Record<string, true> = Object.fromEntries(['backups_completed', 'backups_failed', 'alerts_delivered', 'alerts_failed', 'admin_auth_denied', 'admin_requests', 'admin_actions_completed', 'admin_requests_failed', 'connections_opened', 'connections_closed', 'revocation_errors', 'maintenance_errors', 'request_duration_ms', 'requests_total', 'requests_ok', 'commands_completed'].map(name => [name, true as const]));
+const statisticNames: Record<string, true> = Object.fromEntries(['rooms', 'players', 'connections', 'disconnectedReservations', 'storageHealthy', 'lobbyRevision', 'queuedPlayers', 'queuedParties', 'proposals', 'proposalCount', 'inFlight', 'maintenance', 'revocationHealthy', 'eventLoopP99Ms', 'rssBytes'].map(name => [name, true as const]));
+export type { OperationsPage } from './diagnostics.js';
+
+export class OperationsError extends Error {
+  constructor(public readonly status: 404 | 409 | 503, public readonly code: 'not_found' | 'not_leader' | 'conflict' | 'unavailable') { super(code); }
+}
 
 export interface OperationsHooks {
   stats(): Record<string, unknown>;
@@ -19,8 +26,20 @@ export interface OperationsHooks {
   closeRoom(roomId: string): Promise<void>;
   reportMatch(matchId: string, state: 'ended' | 'failed'): Promise<void>;
   reportPlayerResult(matchId: string, playerId: string, result: Record<string, string | number | boolean>): Promise<void>;
-  maintenance(enabled: boolean): void;
+  maintenance(enabled: boolean): void | Promise<void>;
   audit(limit: number): unknown[];
+  rooms(cursor: string | undefined, limit: number): OperationsPage;
+  room(roomId: string): unknown | undefined;
+  matches(cursor: string | undefined, limit: number): OperationsPage;
+  match(matchId: string): unknown | undefined;
+  queueDiagnostics(): unknown;
+  integrations(): unknown;
+  clusterHealth(): unknown;
+  authorizeMutation(): void | Promise<void>;
+  reconcileMatch(matchId: string): Promise<unknown>;
+  chatReports(cursor: string | undefined, limit: number): OperationsPage;
+  chatReport(reportId: string): unknown | undefined;
+  reviewChatReport(reportId: string, action: 'dismiss' | 'mute' | 'ban', until: number, reason: string): Promise<void>;
 }
 export interface OperationsService {
   address(): AddressInfo | undefined;
@@ -107,7 +126,7 @@ export async function startOperations(config: Config, hooks: OperationsHooks): P
   let alertTask: Promise<void> | undefined;
   const timers: NodeJS.Timeout[] = [];
   const metric = (name: string, value = 1): void => {
-    if (!/^[a-z][a-z0-9_]{0,63}$/.test(name) || !Number.isFinite(value) || (!counters.has(name) && counters.size >= 64)) return;
+    if (!(Object.hasOwn(metricNames, name) || (name.startsWith('errors_') && Object.hasOwn(ERROR_MESSAGES, name.slice(7)))) || !Number.isFinite(value) || (!counters.has(name) && counters.size >= 128)) return;
     const next = (counters.get(name) ?? 0) + value;
     if (Number.isFinite(next)) counters.set(name, next);
   };
@@ -142,22 +161,49 @@ export async function startOperations(config: Config, hooks: OperationsHooks): P
       metric('admin_requests');
       const url = new URL(request.url ?? '/', 'http://localhost');
       if (request.method === 'GET') {
+        if (['/rooms', '/matches', '/chat/reports'].includes(url.pathname)) {
+          const { cursor, limit } = pagination(url);
+          const page = url.pathname === '/rooms' ? hooks.rooms(cursor, limit) : url.pathname === '/matches' ? hooks.matches(cursor, limit) : hooks.chatReports(cursor, limit);
+          reply(response, 200, projectPage(page, limit, url.pathname === '/chat/reports', cursor)); return;
+        }
+        const detail = /^\/(rooms|matches|chat\/reports)\/([^/]+)$/.exec(url.pathname);
+        if (detail) {
+          if (url.search) throw new Error('Invalid request');
+          const identifier = decodeURIComponent(detail[2] ?? '');
+          if (!id(identifier)) throw new Error('Invalid request');
+          const value = detail[1] === 'rooms' ? hooks.room(identifier) : detail[1] === 'matches' ? hooks.match(identifier) : hooks.chatReport(identifier);
+          if (value === undefined) { reply(response, 404, { error: 'not_found' }); return; }
+          reply(response, 200, projectDiagnostic(value, detail[1] === 'chat/reports')); return;
+        }
         if (url.pathname === '/audit') {
           if ([...url.searchParams.keys()].some(key => key !== 'limit') || url.searchParams.getAll('limit').length > 1) throw new Error('Invalid request');
           const limit = Number(url.searchParams.get('limit') ?? 100);
           if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) throw new Error('Invalid request');
-          reply(response, 200, { audit: hooks.audit(limit) }); return;
+          reply(response, 200, { audit: hooks.audit(limit).slice(0, limit).map(event => projectDiagnostic(event)) }); return;
         }
         if (url.search) throw new Error('Invalid request');
         if (url.pathname === '/health') { reply(response, 200, { status: 'ok' }); return; }
         if (url.pathname === '/ready') { const ready = hooks.ready(); reply(response, ready ? 200 : 503, { ready }); return; }
+        if (url.pathname === '/queue') { reply(response, 200, projectDiagnostic(hooks.queueDiagnostics())); return; }
+        if (url.pathname === '/integrations') { reply(response, 200, projectDiagnostic(hooks.integrations())); return; }
+        if (url.pathname === '/cluster') { reply(response, 200, projectDiagnostic(hooks.clusterHealth())); return; }
         if (url.pathname === '/metrics') {
-          const stats = Object.fromEntries(Object.entries(hooks.stats()).filter(([name, value]) => /^[a-z][a-zA-Z0-9_]{0,63}$/.test(name) && !/id|token|ticket|secret|password|authorization/i.test(name) && (typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value)))).slice(0, 64));
+          const stats = Object.fromEntries(Object.entries(hooks.stats()).filter(([name, value]) => Object.hasOwn(statisticNames, name) && (typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value)))));
           reply(response, 200, { counters: Object.fromEntries(counters), stats, integrations: { backups: options.backupDirectory ? 'enabled' : 'unconfigured', alerts: options.alertUrl ? 'enabled' : 'unconfigured', logging: options.logPath ? 'enabled' : 'unconfigured' } }); return;
         }
       } else if (request.method === 'POST' && !url.search) {
         const input = await body(request);
+        await hooks.authorizeMutation();
         switch (url.pathname) {
+          case '/matches/reconcile':
+            fields(input, ['matchId']); if (!id(input.matchId)) throw new Error('Invalid request');
+            reply(response, 200, { ok: true, reconcile: projectDiagnostic(await hooks.reconcileMatch(input.matchId)) });
+            metric('admin_actions_completed'); return;
+          case '/chat/reports/review':
+            fields(input, ['reportId', 'action', 'until', 'reason']);
+            if (!id(input.reportId) || !['dismiss', 'mute', 'ban'].includes(String(input.action)) || typeof input.action !== 'string' || !timestamp(input.until) || typeof input.reason !== 'string' || Buffer.byteLength(input.reason) > 256 || /[\p{Cc}\p{Cs}]/u.test(input.reason)) throw new Error('Invalid request');
+            if (input.action === 'dismiss' ? input.until !== 0 : input.until <= Date.now()) throw new Error('Invalid request');
+            await hooks.reviewChatReport(input.reportId, input.action as 'dismiss' | 'mute' | 'ban', input.until, input.reason); break;
           case '/ban':
             fields(input, ['playerId', 'until', 'reason']);
             if (!playerId(input.playerId) || !timestamp(input.until) || typeof input.reason !== 'string' || Buffer.byteLength(input.reason) > 256 || /[\p{Cc}\p{Cs}]/u.test(input.reason)) throw new Error('Invalid request');
@@ -188,13 +234,23 @@ export async function startOperations(config: Config, hooks: OperationsHooks): P
           }
           case '/maintenance':
             fields(input, ['enabled']); if (typeof input.enabled !== 'boolean') throw new Error('Invalid request');
-            hooks.maintenance(input.enabled); break;
+            await hooks.maintenance(input.enabled); break;
           default: reply(response, 404, { error: 'not_found' }); return;
         }
         metric('admin_actions_completed'); reply(response, 200, { ok: true }); return;
       }
       reply(response, 404, { error: 'not_found' });
-    })().catch(() => { metric('admin_requests_failed'); if (!response.headersSent) reply(response, 400, { error: 'request_failed' }); else response.destroy(); });
+    })().catch((error: unknown) => {
+      metric('admin_requests_failed');
+      if (response.headersSent) { response.destroy(); return; }
+      if (error instanceof OperationsError) { reply(response, error.status, { error: error.code }); return; }
+      if (error instanceof ProtocolError) {
+        const missing = ['room_not_found', 'match_not_found', 'report_not_found'].includes(error.code);
+        const unavailable = ['storage_error', 'game_service_unavailable', 'unavailable', 'not_leader', 'cluster_unavailable', 'fenced'].includes(error.code);
+        reply(response, missing ? 404 : unavailable ? 503 : 409, { error: missing ? 'not_found' : unavailable ? 'unavailable' : 'conflict' }); return;
+      }
+      reply(response, 400, { error: 'request_failed' });
+    });
   }) : undefined;
   if (server) {
     server.requestTimeout = 5000; server.headersTimeout = 5000; server.timeout = 5000; server.maxRequestsPerSocket = 1; server.maxConnections = 32;
