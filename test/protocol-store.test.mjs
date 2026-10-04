@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import { loadConfig, validateConfig } from '../dist/config.js';
-import { parseClient, ProtocolError } from '../dist/protocol/index.js';
+import { parseClient, ProtocolError, CLIENT_FIELDS } from '../dist/protocol/index.js';
 import { SqliteRoomStore } from '../dist/store/index.js';
 import { backupDatabase } from '../dist/store/backup.js';
 import { dev } from './helpers.mjs';
@@ -28,6 +28,9 @@ test('commented config loads and security modes fail closed; # inside strings is
   assert.throws(() => validateConfig({ ...config, server: { ...config.server, listenHost: '0.0.0.0' } }, dev), /loopback/);
   assert.throws(() => validateConfig({ ...config, auth: { ...config.auth, mode: 'jwks' } }, dev), /JWKS/);
   assert.throws(() => validateConfig({ ...config, auth: { ...config.auth, mode: 'jwks', jwksUrl: 'https://issuer.example/jwks', issuer: 'https://issuer.example', audience: 'beacon', revocationUrl: 'https://issuer.example/revocations', revocationTokenFile: '' } }, dev), /token file/);
+  const schema = JSON.parse(await readFile(new URL('../protocol.schema.json', import.meta.url), 'utf8'));
+  assert.deepEqual(schema.clientCommands, CLIENT_FIELDS);
+  assert.equal(schema.version, 2);
   const dir = await mkdtemp(join(tmpdir(), 'beacon-config-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   config.auth.mockPlayers[0].token = 'quoted-"-#-token';

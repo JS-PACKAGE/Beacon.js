@@ -1,0 +1,53 @@
+{
+  "protocol": "beacon",
+  "version": 2,
+  "clientCommands": {
+    "auth": ["token", "protocolVersion"],
+    "refresh_auth": ["token"],
+    "select_game": ["gameId", "version", "mode", "region"],
+    "switch_game": ["gameId", "version", "mode", "region"],
+    "list_rooms": ["page", "pageSize", "cursor", "version", "mode", "region", "query", "availableOnly", "sort"],
+    "create_room": ["name", "password", "maxPlayers", "visibility", "locked", "joinPolicy", "maxSpectators", "rules", "version", "mode", "region"],
+    "join_room": ["roomId", "password", "role", "invitationToken"],
+    "ready": ["ready"],
+    "start_game": [],
+    "update_room": ["name", "password", "maxPlayers", "visibility", "locked", "joinPolicy", "maxSpectators", "rules"],
+    "kick_player": ["playerId", "ban"],
+    "unban_player": ["playerId"],
+    "transfer_host": ["playerId"],
+    "invite_player": ["playerId"],
+    "quick_join": ["version", "mode", "region", "query", "availableOnly", "sort", "password"],
+    "queue_join": ["minPlayers", "maxPlayers", "version", "mode", "region"],
+    "queue_leave": [],
+    "party_create": [],
+    "party_invite": ["playerId"],
+    "party_accept": ["invitationToken"],
+    "party_leave": [],
+    "friend_request": ["playerId"],
+    "friend_respond": ["playerId", "accept"],
+    "friend_remove": ["playerId"],
+    "list_friends": [],
+    "list_games": [],
+    "sync_state": [],
+    "leave_room": [],
+    "delete_room": ["roomId"],
+    "ping": [],
+    "list_owned_rooms": [],
+    "block_player": ["playerId"],
+    "unblock_player": ["playerId"],
+    "list_blocks": []
+  },
+  "rules": {
+    "description": "Flat room settings forwarded to POST /v1/matches. map is the conventional key for a map id.",
+    "maxKeys": 16,
+    "maxJsonBytes": 1024,
+    "valueTypes": ["string", "boolean", "integer"]
+  },
+  "serverMessages": [
+    "hello", "auth_ok", "auth_refreshed", "auth_fail", "result", "error", "pong",
+    "lobby_state", "lobby_update", "room_joined", "room_state", "room_closed", "session_state",
+    "games", "friends", "friend_presence", "party_state", "party_invitation", "room_invitation",
+    "queue_state", "match_found", "game_started", "game_admission", "match_result",
+    "owned_rooms", "blocks", "snapshot_chunk", "server_draining"
+  ]
+}

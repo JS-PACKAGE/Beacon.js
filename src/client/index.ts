@@ -3,6 +3,7 @@ export type { ClientMessage as BeaconCommand } from '../protocol/index.js';
 export type BeaconRoomFilters = Omit<Extract<ClientMessage, { type: 'list_rooms' }>, 'type' | 'requestId'>;
 export type BeaconRoomInput = RoomSettings & Compatibility & { name: string };
 
+export interface BeaconPlayer { readonly id: string; readonly displayName: string }
 export type BeaconMessage = Readonly<Record<string, unknown>> & { readonly type: string };
 export interface BeaconSocket {
   readonly readyState: number;
@@ -33,7 +34,7 @@ export interface RequestOptions {
 export interface BeaconResult { requestId: string; messages: readonly BeaconMessage[] }
 export interface BeaconState {
   connection: 'disconnected' | 'connecting' | 'authenticating' | 'connected' | 'reconnecting';
-  player: unknown;
+  player: BeaconPlayer | null;
   session: BeaconMessage | null;
   lobby: BeaconMessage | null;
   room: BeaconMessage | null;
@@ -302,7 +303,8 @@ export class BeaconClient {
     const revision = this.snapshotRevision(message);
     if (revision !== undefined && revision < (this.revisions.get(this.scope(message)) ?? -1)) return;
     if (message.type === 'auth_ok' || message.type === 'auth_refreshed') {
-      this.current = { ...this.current, player: message.player };
+      const player = message.player;
+      if (record(player) && typeof player.id === 'string' && typeof player.displayName === 'string') this.current = { ...this.current, player: { id: player.id, displayName: player.displayName } };
       clearTimeout(this.refreshTimer); this.refreshTimer = undefined;
       if (typeof message.expiresAt === 'number' && Number.isFinite(message.expiresAt)) {
         this.refreshTimer = setTimeout(() => {
@@ -386,5 +388,26 @@ export class BeaconClient {
   setReady(ready: boolean): Promise<BeaconResult> { return this.request({ type: 'ready', ready }); }
   startGame(): Promise<BeaconResult> { return this.request({ type: 'start_game' }); }
   ping(): Promise<BeaconResult> { return this.request({ type: 'ping' }); }
+  updateRoom(settings: RoomSettings): Promise<BeaconResult> { return this.request({ type: 'update_room', ...settings }); }
+  kickPlayer(playerId: string, ban = false): Promise<BeaconResult> { return this.request({ type: 'kick_player', playerId, ...(ban ? { ban } : {}) }); }
+  unbanPlayer(playerId: string): Promise<BeaconResult> { return this.request({ type: 'unban_player', playerId }); }
+  transferHost(playerId: string): Promise<BeaconResult> { return this.request({ type: 'transfer_host', playerId }); }
+  invitePlayer(playerId: string): Promise<BeaconResult> { return this.request({ type: 'invite_player', playerId }); }
+  quickJoin(filters: BeaconRoomFilters & { password?: string } = {}): Promise<BeaconResult> { return this.request({ ...filters, type: 'quick_join' }); }
+  queueJoin(options: { minPlayers?: number; maxPlayers?: number } & Compatibility = {}): Promise<BeaconResult> { return this.request({ ...options, type: 'queue_join' }); }
+  queueLeave(): Promise<BeaconResult> { return this.request({ type: 'queue_leave' }); }
+  partyCreate(): Promise<BeaconResult> { return this.request({ type: 'party_create' }); }
+  partyInvite(playerId: string): Promise<BeaconResult> { return this.request({ type: 'party_invite', playerId }); }
+  partyAccept(invitationToken: string): Promise<BeaconResult> { return this.request({ type: 'party_accept', invitationToken }); }
+  partyLeave(): Promise<BeaconResult> { return this.request({ type: 'party_leave' }); }
+  friendRequest(playerId: string): Promise<BeaconResult> { return this.request({ type: 'friend_request', playerId }); }
+  friendRespond(playerId: string, accept: boolean): Promise<BeaconResult> { return this.request({ type: 'friend_respond', playerId, accept }); }
+  friendRemove(playerId: string): Promise<BeaconResult> { return this.request({ type: 'friend_remove', playerId }); }
+  listFriends(): Promise<BeaconResult> { return this.request({ type: 'list_friends' }); }
+  switchGame(gameId: string, compatibility: Compatibility = {}): Promise<BeaconResult> { return this.request({ type: 'switch_game', gameId, ...compatibility }); }
+  listGames(): Promise<BeaconResult> { return this.request({ type: 'list_games' }); }
   listOwnedRooms(): Promise<BeaconResult> { return this.request({ type: 'list_owned_rooms' }); }
+  blockPlayer(playerId: string): Promise<BeaconResult> { return this.request({ type: 'block_player', playerId }); }
+  unblockPlayer(playerId: string): Promise<BeaconResult> { return this.request({ type: 'unblock_player', playerId }); }
+  listBlocks(): Promise<BeaconResult> { return this.request({ type: 'list_blocks' }); }
 }
