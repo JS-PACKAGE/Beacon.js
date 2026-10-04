@@ -6,7 +6,7 @@ import { readSecretFile } from './auth/secrets.js';
 export interface Config {
   server: { listenHost: string; listenPort: number; trustProxy: boolean; trustedProxyAddresses: string[]; allowedOrigins: string[]; allowNoOrigin: boolean };
   public: { domain: string; tls: 'proxy' | 'direct'; certPath: string; keyPath: string };
-  auth: { mode: 'mock' | 'jwks' | 'remote'; jwksUrl: string; issuer: string; audience: string; apiUrl: string; timeoutMs: number; jwksCacheTtlSec: number; mockPlayers: { token: string; id: string; displayName: string }[]; revocationUrl: string; revocationIntervalMs: number };
+  auth: { mode: 'mock' | 'jwks' | 'remote'; jwksUrl: string; issuer: string; audience: string; apiUrl: string; timeoutMs: number; jwksCacheTtlSec: number; mockPlayers: { token: string; id: string; displayName: string }[]; revocationUrl: string; revocationTokenFile: string; revocationIntervalMs: number };
   games: { apiUrl: string; timeoutMs: number; cacheTtlSec: number; fallback: Omit<Game, 'source'>[]; sessionApiUrl: string; serviceTokenFile: string };
   lobby: { reconnectGraceMs: number; maxRoomsPerPlayer: number; requestCacheSize: number; requestCacheTtlMs: number; snapshotTtlMs: number; inviteTtlMs: number; maxSpectators: number; matchmakingWaitMs: number; maxPartySize: number };
   operations: { enabled: boolean; listenHost: string; listenPort: number; tokenFile: string; logPath: string; logMaxBytes: number; logFiles: number; backupDirectory: string; backupIntervalMs: number; backupRetention: number; alertUrl: string; alertTokenFile: string; alertIntervalMs: number; drainTimeoutMs: number };
@@ -61,8 +61,10 @@ export function validateConfig(value: unknown, dev: DevOptions): Config {
   if (pub.tls === 'direct' && (!pub.certPath || !pub.keyPath)) throw new Error('Direct TLS requires certificate and private key paths');
   if (pub.tls === 'proxy' && server.trustProxy !== true && !dev.insecureWs) throw new Error('Proxy TLS requires trustProxy');
   const auth = record(root.auth, 'auth');
-  keys(auth, ['mode', 'jwksUrl', 'issuer', 'audience', 'apiUrl', 'timeoutMs', 'jwksCacheTtlSec', 'mockPlayers', 'revocationUrl', 'revocationIntervalMs'], 'auth');
-  string(auth.revocationUrl, 'auth.revocationUrl', true); integer(auth.revocationIntervalMs, 'auth.revocationIntervalMs');
+  keys(auth, ['mode', 'jwksUrl', 'issuer', 'audience', 'apiUrl', 'timeoutMs', 'jwksCacheTtlSec', 'mockPlayers', 'revocationUrl', 'revocationTokenFile', 'revocationIntervalMs'], 'auth');
+  string(auth.revocationUrl, 'auth.revocationUrl', true); string(auth.revocationTokenFile, 'auth.revocationTokenFile', true); integer(auth.revocationIntervalMs, 'auth.revocationIntervalMs');
+  if (auth.revocationTokenFile) readSecretFile(auth.revocationTokenFile);
+  if (auth.revocationUrl && auth.mode !== 'mock' && !auth.revocationTokenFile) throw new Error('Revocation list requires a token file');
   if (!['mock', 'jwks', 'remote'].includes(String(auth.mode))) throw new Error('Invalid auth.mode');
   if (auth.mode === 'mock' && !dev.mockAuth) throw new Error('Mock authentication requires --dev-mock-auth');
   for (const key of ['jwksUrl', 'issuer', 'audience', 'apiUrl']) string(auth[key], `auth.${key}`, true);

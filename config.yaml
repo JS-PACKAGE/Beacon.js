@@ -23,7 +23,8 @@
     "apiUrl": "", # remote 模式：驗證 API 基底網址，會 POST /v1/verify
     "timeoutMs": 5000, # 驗證 API 呼叫逾時，毫秒；失敗一律拒絕登入
     "jwksCacheTtlSec": 300, # JWKS 公鑰快取有效秒數
-    "revocationUrl": "", # HTTPS 撤銷清單（GET，無認證標頭）；空值明確停用。設定後為必要依賴，失敗時 fail-closed
+    "revocationUrl": "", # HTTPS 撤銷清單（GET）；空值明確停用。設定後為必要依賴，失敗時 fail-closed
+    "revocationTokenFile": "", # 撤銷清單 bearer token 檔（0600）。非 mock 且設定了 revocationUrl 時必填
     "revocationIntervalMs": 60000, # 撤銷清單輪詢間隔，毫秒
     "mockPlayers": [ # 僅供本機測試的固定 token 與身分，非正式憑證
       { "token": "dev-alice", "id": "alice", "displayName": "Alice" },

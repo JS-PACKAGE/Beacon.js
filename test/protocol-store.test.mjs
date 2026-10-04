@@ -27,6 +27,7 @@ test('commented config loads and security modes fail closed; # inside strings is
   assert.throws(() => validateConfig(config, { mockAuth: false, insecureWs: false }), /Mock authentication/);
   assert.throws(() => validateConfig({ ...config, server: { ...config.server, listenHost: '0.0.0.0' } }, dev), /loopback/);
   assert.throws(() => validateConfig({ ...config, auth: { ...config.auth, mode: 'jwks' } }, dev), /JWKS/);
+  assert.throws(() => validateConfig({ ...config, auth: { ...config.auth, mode: 'jwks', jwksUrl: 'https://issuer.example/jwks', issuer: 'https://issuer.example', audience: 'beacon', revocationUrl: 'https://issuer.example/revocations', revocationTokenFile: '' } }, dev), /token file/);
   const dir = await mkdtemp(join(tmpdir(), 'beacon-config-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   config.auth.mockPlayers[0].token = 'quoted-"-#-token';

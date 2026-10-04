@@ -215,6 +215,14 @@ test('revocation registry rejects malformed/oversized/unreachable data and retai
   const url = await http(t, (_req, res) => reply(res, body));
   const registry = new RevocationRegistry({ ...config, revocationUrl: url });
   assert.deepEqual(await registry.refresh(), body);
+  const seen = [];
+  const authed = await http(t, (req, res) => { seen.push(req.headers.authorization); reply(res, [{ playerId: 'alice' }]); });
+  const dir = await mkdtemp(join(tmpdir(), 'beacon-revocation-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const tokenFile = join(dir, 'revocation.token');
+  await writeFile(tokenFile, 'revocation-secret\n', { mode: 0o600 });
+  assert.deepEqual(await new RevocationRegistry({ ...config, revocationUrl: authed, revocationTokenFile: tokenFile }).refresh(), [{ playerId: 'alice' }]);
+  assert.deepEqual(seen, ['Bearer revocation-secret']);
   for (const invalid of [[{}], [{ playerId: 'alice', revokedBefore: -1 }], [{ tokenId: 'jti', revokedBefore: 1 }], [{ playerId: 'a', extra: true }], Array(4097).fill({ playerId: 'a' })]) {
     body = invalid;
     await assert.rejects(registry.refresh(), /revocation service unavailable/);

@@ -37,7 +37,7 @@
 11. **驗證模式管制（fail-closed）**：`auth.mode: mock` **僅限本地開發與自動化測試**——啟動時若 `mode=mock` 而未帶開發旗標 `--dev-mock-auth`，**拒絕啟動**；正式部署必須為 `jwks` 或 `remote`。**真實 OAuth 未接通前，不得宣稱正式整合驗收通過**（Gate E ⑧）。
 12. **管理介面**：`operations` HTTP 只綁 loopback、**每個端點**（含 health／ready／metrics）都要 bearer 認證，token 來自 0600 一般檔案（拒絕符號連結、過寬權限），以常數時間比對；請求大小與欄位嚴格受限；每項管理操作寫入持久稽核；metrics 只輸出彙總數值，不含玩家 ID、token、ticket。對外網域仍不得提供任何 HTTP 頁面或管理路由。
 13. **場次憑證隱私**：遊戲 ticket／admission 只送給**該玩家本人**，不得廣播、不得寫入日誌、不得出現在其他玩家可見的訊息或 metrics；服務 bearer token 與 ticket 同屬 `log` 遮蔽範圍。冪等快取只保存雜湊後的請求內容。
-14. **撤銷 fail-closed**：設定了 `auth.revocationUrl` 就是必要依賴——拉取失敗時拒絕新驗證並中斷現有連線；比對 `revokedBefore` 時缺少簽發時間一律視為已撤銷，**不得以 `authAt`（驗證時間）充當簽發時間**。
+14. **撤銷 fail-closed**：設定了 `auth.revocationUrl` 就是必要依賴——拉取失敗時拒絕新驗證並中斷現有連線；比對 `revokedBefore` 時缺少簽發時間一律視為已撤銷，**不得以 `authAt`（驗證時間）充當簽發時間**。非 mock 必須另有 0600 的 `revocationTokenFile`，GET 帶 `Authorization: Bearer`；token 不得寫入設定檔或日誌。
 
 
 日誌補充：第 8 條的伺服器診斷也不得包含可能回顯 token 的任意外部回應體、錯誤訊息或堆疊；僅記安全的分類與遮蔽後欄位。代理模式必須同時驗證受信任 loopback、forwarded HTTPS 與設定網域 Host；Cloudflare 必須另設規則拒絕 HTTP（包含 WS upgrade），不能僅依賴 HTTPS redirect。

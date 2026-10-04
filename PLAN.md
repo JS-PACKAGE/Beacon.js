@@ -177,6 +177,7 @@
 - **AuthProvider 介面**：`verify(token) → Player | AuthError`；實作：`JwksProvider`、`RemoteVerifyProvider`、`MockAuthProvider`（**僅限本地開發與自動化測試**）。驗證失敗一律斷線，不得降級為匿名。
 - **Mock 使用限制**：`auth.mode: mock` **僅限開發與測試**——正式環境啟動時遇 `mode=mock` 即拒絕啟動（六.11）；**Gate E 的部署驗收與整合驗收禁止以 Mock 通過**：真實 OAuth 尚未接通前，只能宣稱「開發驗收＋部署驗收通過」，**整合驗收維持 blocked，不得隱瞞**（Gate E ⑧）。
 - token **僅存於連線記憶體**，不落日誌、不落檔、不回傳給第三方。
+- **撤銷清單（選用；設定後即必要依賴）**：`GET {auth.revocationUrl}`。非 mock **必須**帶 `Authorization: Bearer`，token 來自 0600 的 `auth.revocationTokenFile`，不得寫入設定檔。回 `[{playerId?, tokenId?, revokedBefore?}]`（`playerId` 與 `tokenId` 至少一項；`revokedBefore` 僅能搭配 `playerId`）。拉取失敗拒絕新驗證並中斷現有連線。比對 `revokedBefore` 時缺少簽發時間視為已撤銷，不得用 `authAt` 充當。
 
 ### 4.2 遊戲伺服器 API（另案）
 本系統需要的最小契約（**待遊戲伺服器定案，見假設 4**）：

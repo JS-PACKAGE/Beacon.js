@@ -1,6 +1,7 @@
 import type { Config } from '../config.js';
 import type { Revocation } from '../types.js';
 import { requestJson } from './http.js';
+import { readSecretFile } from './secrets.js';
 
 export class RevocationError extends Error {
   constructor() { super('Authentication revocation service unavailable'); this.name = 'RevocationError'; }
@@ -9,8 +10,9 @@ export class RevocationRegistry {
   constructor(private readonly config: Config['auth']) {}
   async refresh(): Promise<readonly Revocation[]> {
     if (!this.config.revocationUrl) return Object.freeze([]);
+    const token = this.config.revocationTokenFile ? readSecretFile(this.config.revocationTokenFile) : undefined;
     try {
-      const data = await requestJson(this.config.revocationUrl, this.config.timeoutMs, 262144);
+      const data = await requestJson(this.config.revocationUrl, this.config.timeoutMs, 262144, token, { method: 'GET' });
       if (!Array.isArray(data) || data.length > 4096) throw new RevocationError();
       return Object.freeze(data.map((value: unknown) => {
         if (!value || typeof value !== 'object' || Array.isArray(value)) throw new RevocationError();
