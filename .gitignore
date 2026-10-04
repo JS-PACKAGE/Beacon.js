@@ -4,6 +4,7 @@ data/
 logs/
 backups/
 public-page/
+*.tgz
 .DS_Store
 .env
 .env.*

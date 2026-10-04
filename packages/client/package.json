@@ -1,0 +1,17 @@
+{
+  "name": "@js-package/beacon-client",
+  "version": "3.0.0",
+  "description": "Dependency-free typed Beacon protocol v3 WebSocket SDK for browsers and Node",
+  "type": "module",
+  "sideEffects": false,
+  "license": "Apache-2.0",
+  "engines": { "node": ">=22" },
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "browser": "./dist/index.js", "import": "./dist/index.js" },
+    "./schema": { "types": "./dist/schema.d.ts", "import": "./dist/schema.js" },
+    "./protocol.schema.json": "./protocol.schema.json"
+  },
+  "types": "./dist/index.d.ts",
+  "files": ["dist", "protocol.schema.json", "README.md", "LICENSE"],
+  "publishConfig": { "access": "public" }
+}
