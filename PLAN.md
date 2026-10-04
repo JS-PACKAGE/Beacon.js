@@ -1,8 +1,8 @@
-# Beacon.js 遊戲大廳系統 企劃書 v3.0
+# Beacon.js 遊戲大廳系統企劃書：v3 現行版本與下一階段完整需求
 
-定案範圍：以 **WSS + OAuth** 提供遊戲分區大廳；大廳負責房間、社交、組隊、配對確認與遊戲場次交接，遊戲後端負責遊戲邏輯、技能與實測延遲。本次將前一版所有擴充建議納入，HA 採 **跨主機 gateway + etcd quorum + 單一 elected authority**，不是共享 SQLite 檔案。
+現行範圍：以 **WSS + OAuth** 提供遊戲分區大廳；大廳負責房間、社交、組隊、配對確認與遊戲場次交接，遊戲後端負責遊戲邏輯、技能與實測延遲。已交付版本的十二項擴充採 **跨主機 gateway + etcd quorum + 單一 elected authority**，不是共享 SQLite 檔案。
 
-本文件是完整現行企劃，不以舊章節與附錄互相覆蓋。取代 v2 的即時配房、記憶體佇列、席位暫存結果與根套件 SDK 匯出；桌面原始企劃檔未修改。真實外部整合、實體跨主機部署與發布仍需另取得端點、基礎設施與授權。
+本文件保留完整現行架構與驗收紀錄，並將使用者要求「全部實作」的八項後續功能、外部交付前置及兩項觀影需求逐項納入第十二節。**列入企劃不表示已完成實作或驗收**；下一版套件、協定及資料庫版本須在契約定案後協調。桌面原始企劃檔未修改。
 
 ## 〇、基本資料、目標與邊界
 
@@ -23,7 +23,7 @@
 - 玩家限時完成 OAuth 驗證，選遊戲後才能看房間；房間密碼與容量受嚴格驗證。
 - 開局、補位、觀戰與重連只透過遊戲場次 provider 取得該玩家自己的 ticket。
 - 房間、社交、配對、私人結果與 moderation 可持久恢復，成功 ACK 必須晚於持久提交。
-- 所有十二項本次擴充均有真實實作；缺少必要後端明確拒絕，不用 stub、假 ticket、假 profile 或假完成。
+- 已交付版本的十二項擴充有實作；第十二節的新需求尚待完成。缺少必要後端明確拒絕，不用 stub、假 ticket、假 profile 或假完成。
 - 單機與 HA 使用相同 RoomManager、協定與 SDK；HA 不允許多個 writer 各自接受不同房間狀態。
 
 ### 範圍外
@@ -69,6 +69,17 @@
 | R30 | 可信技能與後端實測 RTT、完整隊伍／角色／隊伍技能平衡、有限等待放寬、可控搜尋預算；無可信後端拒絕 advanced |
 | R31 | 獨立 SDK exports／d.ts／browser／Node／LICENSE／schema／tarball，隔離 consumer 安裝驗證；不發布 |
 | R32 | 跨主機 HA：etcd quorum 選舉／lease／epoch fencing、gateway 路由、changeset journal／checkpoint、故障接管與跨重啟有界 request outcome 去重 |
+| R33 | 本人請求結果查詢、受保護管理查詢與證據驅動復原；未知結果不得清除後重播 |
+| R34 | 每位成員自行設定遊戲角色偏好；入列固定快照；提案與房間顯示分隊／gameRole |
+| R35 | 邀請接受／拒絕／撤回／替換／失效／到期持久提交後，向有權寄收件人推播終態 |
+| R36 | 配對顯示 queuedAt、階段、有限原因與等待放寬階段；可見資訊未變不重推，不捏造 ETA |
+| R37 | 驗證／profile／場次／序列化／SQL／複寫／配對／HA 復原的低基數階段觀測 |
+| R38 | 管理 readonly／operator 權限及安全、有界重疊期間的 token 輪替；完整認證與持久稽核 |
+| R39 | 明確相容性矩陣、停寫／排空確認、原生備份、升級預檢、隔離演練與安全回滾拒絕條件 |
+| R40 | 每遊戲入列／活動場次配額與公平搜尋預算；完整隊伍原子計量，HA 不誤稱多 writer 擴容 |
+| R41 | 真實 OAuth／遊戲／profile 整合，以及實體跨主機／Cloudflare／Mac mini／災難還原驗收 |
+| R42 | 獨立 SDK 發布前檢查、隔離 consumer 驗證、npm 發布與使用者支援文件；外部發布須另有明確授權 |
+| R43 | 觀影畫面不得有非必要捲軸，必須有聲播放；播放器歸屬待定位，與 Beacon 協定分開驗收 |
 
 ## 二、系統架構與工程約束
 
@@ -235,7 +246,7 @@ Cloudflare **另設 block 規則**拒絕設定 domain 的所有 HTTP scheme，�
 | README.md | 實際安裝／設定／protocol v3／SDK tarball／私有管理／單機與 HA 部署／備份／真實驗收與已觀察證據 |
 | AGENTS.md | 工程、架構、資料／adapter／安全硬規則；實作必須遵守，不藉本企劃弱化 |
 | CLAUDE.md | 引用 AGENTS，不建立第二套安全真值 |
-| PLAN.md | 完整現行企劃、R1–R32、架構／契約／安全／部署／風險／gates，不能只附一個不一致的 v3 待辦 |
+| PLAN.md | 完整現行企劃、R1–R43、架構／契約／安全／部署／風險／gates；已交付版本與待實作範圍明確分離 |
 | packages/client | 可獨立打包 exports／d.ts／ESM／LICENSE／README／JSON Schema，未發布，不保留根 ./client alias |
 
 SDK typed subscription、BeaconResult.get 與 state 在 browser／Node 對應真實 wire；未識別／malformed 訊息不進 typed events。打包後必須在隔離 consumer 安裝 tarball、實際 import、strict TypeScript browser／Node compile，不能只斷言檔案文字。
@@ -290,12 +301,12 @@ POST ban／unban／revoke／rooms/close／maintenance／matches/result／matches
 | A 協定／建置／本機安全 | build／typecheck、限時 auth／WSS／loopback／mock 管制及 schema 回歸通過 |
 | B adapter 開發整合 | 本機 HTTP fixture 驗 auth／games／session／profile，真實 adapter 執行；不代表真實外部整合 |
 | C 房間／持久化 | 房密競態／容量／owner-host／restart／DB failure／atomic rollback 行為與 live SDK 場景通過 |
-| D 本機擴充 | R21–R31 端到端 smoke、typed schema／SDK／isolated tarball／chat moderation／immutable ACK results 通過；文件本地已同步，v3 未 push |
+| D 本機擴充 | 已交付 R21–R31 的端到端 smoke、typed schema／SDK／isolated tarball／chat moderation／immutable ACK results 通過；不包含第十二節的新需求 |
 | HA 本機故障證據 | 真實 etcd 3.7.2 三成員＋三 Beacon，HTTP loopback development 及 HTTPS+auth/private WSS 兩模式：共享／kill+restore／原檔重啟／去重／SIGSTOP stale writer 與延遲 ticket／quorum loss 均通過 |
 | E 正式外部交付 | **blocked**：真實 OAuth 有效／過期 token、真實遊戲與 profile、外部 WSS／HTTP block、Mac mini 開機未登入／非 root／備份還原、跨實體主機 TLS／failover／quorum、設定改動生效與安全證據；不以 mock 通過 |
-| 提交／發布 | 依使用者指示分功能提交；push／release／npm publish／Pages／production 仍需另行授權，本次未執行 |
+| 提交／發布 | 已依使用者指示分功能提交並推送 main，建立 GitHub v1.1 release；內部套件／protocol 仍為 3.0.0／v3。未 npm publish、Pages 發布或 production 部署；後續外部操作仍須對應授權 |
 
-### 2026-10-04 本次實際證據
+### 2026-10-04 已交付版本實際證據（非本次新需求的驗收）
 
 - Node 26.7.0：build、typecheck、完整 node --test **144/144**、部署安全工具測試 **4/4**，npm audit --omit=dev **0 vulnerabilities**。
 - 實際 SDK → WebSocket → SQLite → HTTP game/profile：封鎖與重新同意、邀請 mailbox 終態、隊伍權限／密碼整隊入房、capability 小數 rules、聊天／report／mute、刪房後結果／重複衝突／ACK／restart、可信角色配對提案與全員接受、AbortSignal 通過。
@@ -313,3 +324,174 @@ POST ban／unban／revoke／rooms/close／maintenance／matches/result／matches
 4. Cloudflare Tunnel／DNS／HTTP block、Mac mini 開機與權限、真實 token 驗證／外部 WSS／真實場次與可信 profile 證據尚不可用；完成可達實作，不宣稱 Gate E 通過。
 5. CI 保留 Node24／26 十平台組合；本次只跑此 macOS arm64 的 Node26，未把 CI 設定當執行結果。
 6. npm package 名稱已選 @js-package/beacon-client，但 registry 尚未發布，也未驗證遠端命名權限；本次交付的是可安裝 tarball 與原始碼，不是已可 npm install 的公開版本。
+
+## 十二、下一階段完整實作與驗收
+
+### 狀態與交付界線
+
+- 使用者已要求八項建議全部納入實作，並要求將全部事項寫入本文件；不得只做其中五項或默默略過條件項。
+- 本次優先交付完整企劃。開始過但尚未整合／驗證的程式草稿已留存於工作區外，原始碼恢復已發布基線；**下列新功能一律尚未完成，不沿用前一版的 144/144 作為新功能證據**。
+- 下一版版本號尚未定案。若移除原 `queue_join.rolePreferences` 語意，必須同步切換 server、SDK、schema、所有 callers／測試／文件，明確提升協定版本，不以 alias／shim 維持兩套偏好真值。
+- 各項完成必須同時包含真實實作、相關型別／schema／SDK、必要回歸、實際執行 smoke 與操作文件；不把空路由、假資料或待接 API 稱為完成。
+
+### N1／R33：未知請求結果查詢與安全復原
+
+**需求**
+
+- 玩家僅可查詢自己的 `requestId`，區分未找到、執行中、已完成與未知結果；回覆不包含其他玩家的資料或原始憑證。
+- operator 可透過受保護、受稽核的管理查詢及復原流程處理特定請求；readonly 不可取得私有請求關聯資訊或執行復原。
+- 將請求的玩家／ID／內容雜湊與可證明的持久完成證據關聯，涵蓋「業務已完成，但 durable outcome 尚未提交就中斷」的窗口。只保存必要、有界、可遮蔽的 metadata，不保存 password／token 原始 body。
+- 復原只有在 durable evidence 或 provider 的原 operationId 查詢能證明結果時才成立；只看到房間存在，不足以猜測整個指令已成功。
+- 已知終態可依 replay window 清理；未知 tombstone 不因 TTL 到期變成可重播。容量滿時明確 fail-closed，不提供「清除後重試」、任意換 ID 或管理員猜結果的按鈕。
+- 已有 `/matches/reconcile` 保留場次領域職責；不得把它誤稱通用請求復原。恢復出的確認結果如缺少原直接 response，必須要求重新同步，不能重造私人 ticket。
+- 單機與 HA 的耐久保證須各自列清；未做到單機跨重啟去重，不得套用 HA 的宣稱。
+
+**驗收**
+
+- 中斷前／業務提交後／完成證據後／outcome 提交後各窗口的故障與重啟演練；已證實結果不重做，不明外部副作用仍保留未知。
+- 相同 ID 不同內容衝突、跨玩家不可見、私密回應不洩漏、滿容量拒絕、quorum loss／stale epoch 不可復原或發布成功。
+
+### N2／R34：成員角色偏好與分隊資訊
+
+**需求**
+
+- 每位玩家自行設定所選遊戲的角色偏好，驗證合法 roles、去重與長度；隊長不得用單一偏好陣列覆寫整隊。
+- 入列固定每位成員偏好與 roster 快照；入列後修改必須明確拒絕或先退出重新入列，不能悄悄改已提出的組合。切遊戲、重連、重啟的保存範圍明確定義。
+- 不拆隊 matcher 使用上述快照；提案接受前可看到完整 team／gameRole assignments，確認後房間成員與 GameSessionProvider roster 一致。
+- 手動房間既有自動分隊開局流程必須持續成立；不因新資訊展示強迫所有遊戲使用手動分隊。
+
+**驗收**
+
+- 本人偏好設定／非法角色／隊長越權、不同成員偏好保持獨立、完整隊伍不拆、快照不被後改動污染。
+- 真實 SDK 能看到提案 assignments、全員確認後相同房間資訊及 provider 輸入；房間重新開局、離房／補位／重連的 assignment 不殘留或誤配。
+
+### N3／R35：邀請終態雙向推播
+
+**需求**
+
+- 接受、拒絕、寄件人撤回、替換舊邀請、房間／隊伍改動撤銷、封鎖及到期均先原子持久化，再通知有權且在線的寄件人與收件人。
+- 直接回應保留原 requestId；另一方與狀態廣播使用 Peer.send，不攜帶該 requestId。第三方不得取得 invitationToken。
+- SDK 即時更新 incoming／outgoing 收件匣；離線者以登入／sync 的持久快照恢復終態。不建立另一個通知服務作為第二套真值。
+- 同一轉換只發必要更新；失敗 rollback 不可先推送終態。
+
+**驗收**
+
+- 每種終態的雙方即時狀態、離線後登入同步、替換與封鎖、到期維護、提交失敗無推播、陌生玩家零洩漏。
+
+### N4／R36：可解釋配對佇列
+
+**需求**
+
+- 公開本人 `queuedAt`、目前階段、有限分類的等待原因與等待放寬階段；重列保留原等待年齡，SDK 保存一致狀態。
+- 原因至少可區分人數不足、角色供給不足、條件未滿足、可信 profile 不可用、搜尋預算耗盡與該遊戲活動配額。分類須有 matcher／adapter 的實際證據，不以推測冒充精確原因。
+- 階段涵蓋等待、提案確認及終止，定義重新入列／取消／到期／維護的狀態轉換。推播僅在對方可見欄位改變時發送。
+- 配對不是簡單 FIFO；不提供虛構排隊名次或固定 ETA。若未來估計等待時間，必須先有實測樣本與不確定性表示。
+
+**驗收**
+
+- 缺人／缺角色／不合條件／profile failure／budget exhaustion／配額滿的實際場景；時間放寬即時可見、重列年齡不重置、無變更不重推、離線同步一致。
+
+### N5／R37：階段觀測與基線
+
+**需求**
+
+- 固定低基數 stages：request、auth、registry／profile、game create／admit／status／cancel、序列化等待／執行、SQLite commit、複寫 commit、queue wait、HA recovery。
+- 每個階段提供有界 histogram buckets、count／sum／error count；配對原因採固定分類計數，與實際公開原因一致。
+- 補足可實測的 authority 接管時間、複寫進度及落後狀態；無法觀測的跨主機 lag 不捏造數值。區分含外部等待的總延遲與序列化內執行時間。
+- metrics 只輸出彙總，不能以 playerId、roomId、matchId、requestId、token、ticket 或任意 URL 作 label；輸出仍受管理權限與 bytes 上限約束。
+- 先執行容量／故障基線，再訂 SLO、告警門檻與容量承諾；本機 fixture 數字不能當 production 保證。
+
+**驗收**
+
+- 成功／失敗／邊界 bucket 與併發計量正確，輸入非法數值不污染指標；注入慢 auth／profile／provider、SQL 與復原延遲能定位實際階段。
+- 實际 GET metrics 與 SDK 流程可觀測，無敏感 labels，metrics 停用不改變業務成功／失敗語意。
+
+### N6／R38：管理權限與不中斷 token 輪替
+
+**需求**
+
+- 兩個簡單 scope：readonly 可取得授權安全診斷；operator 才能 mutation、私有請求查詢／復原及 credential reload。涉及私人聊天證據的讀取也須明確授權，不因 GET 自動視為公開。
+- 憑證由 config 指定的 0600 一般檔讀取，拒絕 symlink／過寬權限／空或非法內容；digest 常數時間比對，不記 token。
+- 受保護 reload 原子驗證全部新憑證；舊／新 token 只在有界 grace 內共存，到期失效。拒絕跨 scope token 重用與藉輪替提高權限。
+- reload 失敗不接受非法新值，也不丟棄仍合法的現用憑證；不靜默切成免驗證。設定／讀取／輪替流程只使用 config 真值，不新增環境變數覆蓋。
+- 管理操作、拒絕與輪替以安全分類持久稽核；HA 的節點本地憑證輪替與 leader-only 業務 mutation 權限分開，不藉本地 reload 繞過 fencing。
+
+**驗收**
+
+- readonly 各類越權拒絕、無 token 的 health／ready／metrics 全拒絕；有效輪替無中斷、重疊期限邊界、非法替換／symlink／寬權限、稽核儲存失敗與 HA follower 行為。
+
+### N7／R39：升級預檢與安全回滾
+
+**需求**
+
+- 維護 service package／SDK／protocol／SQLite schema／HA checkpoint 格式的明確相容性矩陣；目前已發布基線為 package 3.0.0、protocol 3、schema 5。不能把尚未完成的 schema 6 草稿當現行版本。
+- 使用者主動工具執行 candidate 檢查、service manager 停止證明、排空／停寫確認、原生 SQLite backup、integrity／權限檢查及隔離 migration 演練，不自行部署或啟動 production。
+- 拒絕 active DB、不可接受的 symlink／路徑、未知 candidate、不同 namespace、未支援協定或 schema 降版；manifest 不能單憑自己的 boolean 宣稱可回滾。
+- 同 schema 回滾仍檢查升級後資料／WAL／SHM 是否有新寫入；不可逆 migration 或新業務資料須拒絕自動回滾並保留原檔／證據，明確交由備份／災難復原程序。
+- HA 先規劃停寫與 etcd 權威備份；僅換 SQLite 不算群組回滾。沒有混版相容證據時採協調停機切換，不能宣稱 rolling upgrade。
+- 若要求混版 rolling，另完成 wire／checkpoint／mutation semantics 相容性與實際混版演練後才開放；不為了「零停機」弱化一致性。
+
+**驗收**
+
+- 有效 candidate 預檢與隔離還原；運作中服務拒絕、降版拒絕、manifest 篡改、路徑／權限錯誤、備份失敗、不可逆 migration／新寫入拒絕回滾、所有失敗保留資料。
+
+### N8／R40：遊戲公平配額與單一 authority 邊界
+
+**需求**
+
+- config 明確定義每遊戲 queued players、active matches／reservations 與每輪 formation／搜尋預算；合理預設且可調，不建立與既有 mode 重複的 poolId。
+- 整隊入列以全隊人數原子計量，拒絕時不拆隊或留下半隊；manual start、配對 proposal／確認、starting、in_game、未知 provider allocation、recovering 都依實際保留資源計入。
+- 明確定義確認／拒絕／到期／取消／provider failure／結束／刪房／重啟的 slot 取得與釋放；open 房間的舊 assignments 不得永久佔用活動 quota。
+- 一個遊戲滿配額或大量無解搜尋，不應消耗其他遊戲的全部入列／形成機會；輪轉／分配有界工作量，維持 whole-party 與安全等待放寬。
+- 現行 HA 是故障接管，不是寫入水平分片。完成實測單一 authority 容量與公平性證據；只有量測證實 writer bottleneck 且有具體需求，才定義跨遊戲 authority sharding 與跨 shard social／party 一致性。不得把未做分片稱為可多 writer 擴容。
+
+**驗收**
+
+- 至少兩遊戲隔離：一方填滿／無解，另一方仍可入列並成局；整隊邊界、每輪公平預算、活動 slot 生命週期與重啟恢復、不超配額且不殘留。
+- 容量實測記錄單一 authority 的 throughput、p95／p99、序列化等待、SQL／複寫耗時；公平配額不是 SLA 的替代品。
+
+### E1／R41：真實服務與外部部署交付前置
+
+- **真實 OAuth**：所有者提供正式 JWKS／remote、issuer／audience、有效與過期／撤銷測試身分；驗證成功、錯誤與不可達 fail-closed。
+- **真實遊戲／profile**：確認 capabilities、角色／隊伍、idempotent allocation、admission、status／cancel、結果 callback、skill 與實測 RTT 契約；用真實場次確認私人 ticket 與故障復原。
+- **實體 HA**：3／5 etcd 在不同 failure domains，私網 TLS／ACL／DNS、paused authority、節點故障／接管、quorum loss／恢復及權威備份還原；同機多程序證據不替代。
+- **Cloudflare／Mac mini**：外部只 WSS、HTTP 與 WS 明文被 block、非 loopback 拒絕、開機未登入與非 root daemon、Tunnel 中斷與備份還原；設定改動真的生效。
+- repo 內先完成契約／工具／驗收步驟與安全證據格式。缺少可用端點、測試授權、主機或安全設定時標記 blocked，不能請 assistant 猜憑證或宣稱通過。
+
+### E2／R42：SDK registry 發布與 consumer 支援
+
+- 已完成 GitHub [Beacon.js v1.1 release](https://github.com/JS-PACKAGE/Beacon.js/releases/tag/v1.1)，與 npm 發布不同；獨立 SDK 仍未發布 registry。
+- 發布前驗證 tarball exports／d.ts／ESM／LICENSE／schema、無 runtime deps 與敏感檔、browser／Node strict consumer、實際安裝／import，並核對 server／SDK／protocol 相容性。
+- 提供使用者主動或受保護 workflow 的發布 gate：不可覆蓋既有版本，套件名稱／scope 權限與可用 OIDC／npm 授權必須確認；沒有憑證時不做假 publish。
+- 文件說明公開安裝方式、版本支援、breaking migration、錯誤／重連／本地 abort 與未知結果處理、issue 回報及安全通報；公開安裝命令須等 registry 真的可用才宣稱成立。
+- npm publish、production deploy、Cloudflare 修改、後續 release／push 都須取得各自明確授權，不將「全部實作」當任意外部發布許可。
+
+### V1、V2／R43：觀影捲軸與有聲播放
+
+這兩項是使用者追加的實際體驗要求，**全部記錄，不能漏掉**；目前未提供播放器／頁面／應用位置，也沒有可操作的既有播放分頁，因此不假定它們是 Beacon 的功能或已經修復。
+
+| 編號 | 明確要求 | 驗收 |
+|---|---|---|
+| V1 | 觀影畫面不因播放器或容器尺寸溢位出現非必要水平／垂直捲軸；修正實際布局根因，不只掩蓋畫面或裁掉操作區 | 定位真實播放器後，正常／全螢幕、不同視窗尺寸與比例觀察畫面；影片及控制列完整且無多餘捲軸 |
+| V2 | **直接有聲播放，不用無聲播放代替**；確認 player mute、音量、系統／頁面音訊及瀏覽器播放限制 | 在真實播放表面播放並確認實際可聽見音軌、畫面持續播放；僅有 `muted=false` 或 JS promise 成功不算有聲驗收 |
+
+- 若瀏覽器政策要求使用者手勢，使用真實播放／取消靜音互動，不用靜音 autoplay 冒充完成；無音軌的來源要明確指出，不捏造聲音。
+- 定位播放器歸屬後在正確專案／介面實作，避免把觀影問題塞入大廳 WSS API；所需頁面或應用位置未取得前，此項 blocked。
+
+### 執行順序與新功能 Gates
+
+1. 定案 N1 的安全證據／耐久保證及 N2 的 wire 切換，同步版本與 schema 相容性設計。
+2. 完成 N1、N2、N3、N4 的 server → persistence → protocol → SDK 真實流程；N5 觀測同時覆蓋關鍵邊界。
+3. 完成 N6 管理權限／輪替、N7 升級／回滾工具與 N8 公平配額；所有正常、拒絕與故障窗口驗收。
+4. 執行針對性回歸、build／typecheck、完整既有套件、實際 SDK／管理 HTTP／SQLite smoke、HA 故障演練與隔離 tarball consumer；更新 README 與本 PLAN 的實際證據。
+5. 有外部資源後執行 E1；E2 經發布授權與實際 registry 查核後才標完成。V1／V2 定位後獨立實作與真人可觀察驗收。
+
+| 新 Gate | 通過條件 | 目前狀態 |
+|---|---|---|
+| P 企劃完整性 | N1–N8、E1–E2、V1–V2 全列、有驗收與邊界，與已交付版本區分 | 本文件已納入 |
+| F 功能端到端 | N1–N4 全部 server／store／wire／SDK 可用，安全故障與隱私驗收 | 待實作 |
+| O 可維運性 | N5–N8 指標／權限／輪替／升級／回滾／公平配額真實演練 | 待實作 |
+| X 真實外部交付 | E1 真實服務、主機、Cloudflare 與災難還原證據 | blocked：外部資源／授權未到位 |
+| S SDK registry | E2 發布工具、consumer 驗證、授權、實際 registry 安裝成功 | 待實作／未發布 |
+| V 觀影體驗 | V1 無多餘捲軸，V2 實際有聲播放 | blocked：播放器位置待定位 |
+
