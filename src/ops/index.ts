@@ -1,6 +1,6 @@
 import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
 import { request as httpsRequest } from 'node:https';
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { ProtocolError } from '../protocol/index.js';
 import { readRules } from '../protocol/index.js';
 import { lstatSync } from 'node:fs';
@@ -62,7 +62,7 @@ export async function sendAlert(url: string, token: string, event: string): Prom
   if (url.length > 2048 || token.length > 4096 || /[^\x21-\x7e]/.test(token) || (event !== 'not_ready' && event !== 'backup_failed')) throw new Error('Invalid alert payload');
   const target = new URL(url);
   if (target.username || target.password || target.hash || (target.protocol !== 'https:' && !(target.protocol === 'http:' && loopback(target.hostname.replace(/^\[|\]$/g, ''))))) throw new Error('Invalid alert endpoint');
-  const payload = JSON.stringify({ service: 'beacon', event, at: Date.now() });
+  const payload = JSON.stringify({ service: 'beacon', event, severity: event === 'backup_failed' ? 'critical' : 'warning', id: randomUUID(), at: Date.now() });
   await new Promise<void>((resolve, reject) => {
     // Settle exactly once. destroy() without an error argument avoids a second, unhandled 'error' event.
     let settled = false;

@@ -149,7 +149,9 @@ test('alerts deliver bounded real HTTP webhook requests and reject external plai
   const base = `http://127.0.0.1:${server.address().port}`;
   await sendAlert(base, 'webhook-token', 'not_ready');
   assert.equal(received.token, 'Bearer webhook-token'); assert.equal(received.payload.event, 'not_ready');
-  assert.deepEqual(Object.keys(received.payload).sort(), ['at', 'event', 'service']);
+  assert.deepEqual(Object.keys(received.payload).sort(), ['at', 'event', 'id', 'service', 'severity']);
+  assert.equal(received.payload.severity, 'warning');
+  assert.match(received.payload.id, /^[0-9a-f-]{36}$/);
   await assert.rejects(sendAlert(base + '/large', '', 'not_ready'));
   await assert.rejects(sendAlert('http://example.com/webhook', '', 'not_ready'), /Invalid alert endpoint/);
 });
