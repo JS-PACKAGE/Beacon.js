@@ -20,7 +20,7 @@ const dir = await mkdtemp(join(tmpdir(), 'beacon-load-'));
 const config = await loadConfig('config.yaml', { mockAuth: true, insecureWs: true });
 config.server.listenPort = 0; config.db.path = join(dir, 'load.db');
 config.operations.enabled = false; config.operations.logPath = ''; config.operations.backupDirectory = ''; config.operations.alertUrl = ''; config.operations.drainTimeoutMs = 0;
-config.auth.mode = 'mock'; config.auth.revocationUrl = ''; config.games.apiUrl = ''; config.games.sessionApiUrl = '';
+config.auth.mode = 'mock'; config.auth.revocationUrl = ''; config.games.apiUrl = ''; config.games.sessionApiUrl = ''; config.games.profileApiUrl = ''; config.cluster.enabled = false;
 config.lobby.reconnectGraceMs = 0;
 Object.assign(config.limits, { maxConnections: clients + 10, maxConnectionsPerIp: clients + 10, connectionBurst: clients * 2 + 10, messageBurst: 10000, maxRoomsPerGame: clients + 10 });
 config.auth.mockPlayers = Array.from({ length: clients }, (_, i) => ({ token: `load-${i}`, id: `load-${i}`, displayName: `Load ${i}` }));
@@ -58,7 +58,7 @@ async function connect(index) {
     pending.set(requestId, { messages: [], timer, reject, resolve: messages => { latencies.push(performance.now() - at); resolve(messages); } });
     ws.send(JSON.stringify({ ...message, requestId }));
   });
-  await request({ type: 'auth', token: `load-${index}`, protocolVersion: 2 });
+  await request({ type: 'auth', token: `load-${index}`, protocolVersion: 3 });
   await request({ type: 'select_game', gameId: 'load' });
   return { ws, request };
 }

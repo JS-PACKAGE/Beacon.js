@@ -2,7 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { BeaconClient, BeaconError } from '../dist/client/index.js';
+import { createServer } from 'node:http';
+import { WebSocketServer } from 'ws';
 
+const game = { gameId: 'game', name: 'Game', maxPlayersPerRoom: 8, enabled: true, source: 'config' };
+const roomFixture = input => ({ id: 'room', gameId: 'game', name: 'Room', ownerId: 'owner', hostId: 'owner', playerCount: 1, spectatorCount: 0, maxPlayers: 8, maxSpectators: 0, hasPassword: false, state: 'open', visibility: 'public', locked: false, version: '', mode: '', region: '', joinPolicy: 'closed', revision: 0, createdAt: 1, ...input });
+const memberFixture = input => ({ id: 'member', displayName: 'Member', isHost: false, ready: false, role: 'player', connected: true, ...input });
 class ControlledSocket {
   static instances = [];
   readyState = 0;
@@ -16,7 +21,16 @@ class ControlledSocket {
   emit(type, event = {}) { for (const listener of this.listeners.get(type) ?? []) listener(event); }
   open() { this.readyState = 1; this.emit('open'); }
   send(wire) { this.sent.push(JSON.parse(wire)); }
-  packet(message) { this.emit('message', { data: JSON.stringify(message) }); }
+  packet(input) {
+    let message = input;
+    if (message.type === 'auth_ok') message = { ...message, player: { displayName: 'Player', ...message.player } };
+    if (message.type === 'session_state') message = { ready: false, role: 'player', ...message };
+    if (message.type === 'lobby_state') message = { game, total: message.rooms.length, ...message, rooms: message.rooms.map(roomFixture) };
+    if (message.type === 'room_state') message = { playerCount: message.members.length, change: 'sync', room: roomFixture({ id: message.roomId, revision: message.revision }), ...message };
+    if (message.room) message = { ...message, room: roomFixture(message.room) };
+    if (message.members && ['session_state', 'room_joined', 'room_state'].includes(message.type)) message = { ...message, members: message.members.map(memberFixture) };
+    this.emit('message', { data: JSON.stringify(message) });
+  }
   close() { if (this.readyState === 3) return; this.readyState = 3; this.emit('close'); }
 }
 async function until(predicate) {
@@ -27,7 +41,7 @@ async function authenticate(socket, player = 'player') {
   socket.open();
   await until(() => socket.sent.some(message => message.type === 'auth'));
   const auth = socket.sent.find(message => message.type === 'auth');
-  assert.equal(auth.protocolVersion, 2);
+  assert.equal(auth.protocolVersion, 3);
   // The real server delivers the post-auth snapshot inside the auth request, before its terminal result.
   socket.packet({ type: 'auth_ok', requestId: auth.requestId, player: { id: player } });
   socket.packet({ type: 'session_state', requestId: auth.requestId, room: null, members: [], revision: 1 });
@@ -195,15 +209,16 @@ test('token callback and initial connection are deadline bounded even without a 
 test('bounded friends, games and nested party collections assemble into their original consumer shape', async t => {
   const { client, socket } = await fixture(t);
   for (const [command, type, field] of [
-    ['list_friends', 'friends_state', 'friends'],
-    ['list_games', 'games_state', 'games'],
+    ['list_friends', 'friends', 'friends'],
+    ['list_games', 'games', 'games'],
     ['party_create', 'party_state', 'partyMembers']
   ]) {
     const pending = client.request({ type: command });
     const requestId = socket.sent.at(-1).requestId;
     const metadata = { type, requestId, revision: 0, snapshotId: `${field}-snapshot`, chunkCount: 2 };
     function packet(index) {
-      const values = [{ id: `${field}-${index}` }];
+      const id = `${field}-${index}`;
+      const values = field === 'friends' ? [{ playerId: id, status: 'accepted', requestedBy: 'leader', online: true }] : field === 'games' ? [{ ...game, gameId: id }] : [{ playerId: id, online: true }];
       return field === 'partyMembers'
         ? { ...metadata, chunkIndex: index, party: { id: 'party', leaderId: 'leader', members: values } }
         : { ...metadata, chunkIndex: index, [field]: values };
@@ -213,8 +228,104 @@ test('bounded friends, games and nested party collections assemble into their or
     socket.packet({ type: 'result', requestId, ok: true });
     const result = (await pending).messages[0];
     const values = field === 'partyMembers' ? result.party.members : result[field];
-    assert.deepEqual(values.map(value => value.id), [`${field}-0`, `${field}-1`]);
+    assert.deepEqual(values.map(value => value.playerId ?? value.gameId), [`${field}-0`, `${field}-1`]);
     assert.equal(result.chunkCount, undefined);
     if (field === 'partyMembers') assert.equal(result.party.leaderId, 'leader');
   }
+});
+
+test('AbortSignal removes retained requests and listeners without canceling committed state pushes', async t => {
+  const { client, socket } = await fixture(t, { maxPending: 1 });
+  const controller = new AbortController();
+  let added = 0, removed = 0;
+  const add = controller.signal.addEventListener.bind(controller.signal);
+  const remove = controller.signal.removeEventListener.bind(controller.signal);
+  controller.signal.addEventListener = (...args) => { added++; add(...args); };
+  controller.signal.removeEventListener = (...args) => { removed++; remove(...args); };
+  const pending = client.partyCreate({ signal: controller.signal, retryOnReconnect: true });
+  const requestId = socket.sent.at(-1).requestId;
+  controller.abort();
+  await assert.rejects(pending, error => error.code === 'aborted');
+  assert.equal(added, removed);
+  socket.packet({ type: 'party_state', party: { id: 'party', leaderId: 'player', members: [{ playerId: 'player', online: true }] } });
+  socket.packet({ type: 'result', requestId, ok: true });
+  assert.equal(client.state.party.id, 'party');
+  const next = client.ping(); const id = socket.sent.at(-1).requestId;
+  socket.packet({ type: 'pong', requestId: id }); socket.packet({ type: 'result', requestId: id, ok: true });
+  assert.equal((await next).get('pong').type, 'pong');
+  const count = socket.sent.length;
+  await assert.rejects(client.ping({ signal: controller.signal }), error => error.code === 'aborted');
+  assert.equal(socket.sent.length, count);
+});
+
+test('social, proposal and durable result pushes normalize state and acknowledgement removes results', async t => {
+  const { client, socket } = await fixture(t);
+  socket.packet({ type: 'friends', friends: [{ playerId: 'friend', status: 'accepted', requestedBy: 'player', online: false }] });
+  socket.packet({ type: 'friend_presence', playerId: 'friend', online: true, gameId: 'game' });
+  assert.equal(client.state.friends.friend.gameId, 'game');
+  socket.packet({ type: 'blocks', playerIds: ['blocked'] });
+  socket.packet({ type: 'invitations', invitations: [{ invitationToken: 'invite', target: 'player', sender: 'sender', status: 'pending', createdAt: 1, expiresAt: 100 }] });
+  assert.equal(client.state.invitations.invite.target, 'player');
+  socket.packet({ type: 'invitation_resolved', invitationToken: 'invite', status: 'declined' });
+  assert.deepEqual(client.state.invitations, {});
+  socket.packet({ type: 'queue_state', queued: true, queueId: 'queue', expiresAt: 100 });
+  socket.packet({ type: 'match_proposal', proposalId: 'proposal', deadline: 100, members: ['player'], accepted: [] });
+  assert.equal(client.state.proposal.proposalId, 'proposal');
+  socket.packet({ type: 'match_proposal_resolved', proposalId: 'proposal', reason: 'declined' });
+  assert.equal(client.state.proposal, null);
+  const result = { resultId: 'result', matchId: 'match', playerId: 'player', roomId: 'room', result: { score: 0 }, createdAt: 1 };
+  socket.packet({ type: 'match_result', ...result });
+  socket.packet({ type: 'match_results', results: [{ ...result, resultId: 'result2' }] });
+  assert.deepEqual(Object.keys(client.state.results), ['result', 'result2']);
+  socket.packet({ type: 'match_result_acked', resultId: 'result' });
+  assert.deepEqual(Object.keys(client.state.results), ['result2']);
+});
+
+test('acknowledged result history stays in typed replies without resurrecting the pending inbox', async t => {
+  const { client, socket } = await fixture(t);
+  const result = { resultId: 'result', matchId: 'match', playerId: 'player', roomId: 'room', result: { score: 1 }, createdAt: 1 };
+  socket.packet({ type: 'match_result', ...result });
+  socket.packet({ type: 'match_result_acked', resultId: result.resultId });
+  assert.deepEqual(client.state.results, {});
+  const history = client.listMatchResults();
+  const requestId = socket.sent.at(-1).requestId;
+  const acknowledged = { ...result, acknowledgedAt: 2 };
+  socket.packet({ type: 'match_results', requestId, results: [acknowledged] });
+  socket.packet({ type: 'result', requestId, ok: true });
+  assert.deepEqual((await history).get('match_results').results, [acknowledged]);
+  assert.deepEqual(client.state.results, {});
+  socket.packet({ type: 'match_result', ...result });
+  assert.equal(client.state.results.result.resultId, 'result');
+  socket.packet({ type: 'match_results', results: [acknowledged] });
+  assert.deepEqual(client.state.results, {});
+  socket.packet({ type: 'match_result', ...acknowledged });
+  assert.deepEqual(client.state.results, {});
+});
+
+test('unknown and malformed wire shapes never reach typed events', async t => {
+  const { client, socket } = await fixture(t);
+  const messages = [], errors = [];
+  client.on('message', message => messages.push(message)); client.on('error', error => errors.push(error.code));
+  socket.emit('message', { data: JSON.stringify({ type: 'friends', friends: [{ playerId: 3 }] }) });
+  assert.deepEqual(messages, []); assert.deepEqual(errors, ['invalid_message']);
+  assert.equal(client.state.connection, 'disconnected');
+});
+
+test('malformed frames close a native WebSocket and reject connection without an invalid close-code exception', async t => {
+  const server = createServer();
+  const sockets = new WebSocketServer({ server });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const client = new BeaconClient({ url: `ws://127.0.0.1:${server.address().port}`, token: () => 'fixture', allowInsecure: true, reconnect: false });
+  t.after(async () => {
+    client.disconnect();
+    for (const peer of sockets.clients) peer.terminate();
+    await new Promise(resolve => sockets.close(resolve));
+    await new Promise(resolve => server.close(resolve));
+  });
+  const errors = [];
+  client.on('error', error => errors.push(error.code));
+  sockets.on('connection', peer => peer.send(JSON.stringify({ type: 'unknown_frame' })));
+  await assert.rejects(client.connect(), error => error.code === 'disconnected');
+  assert.deepEqual(errors, ['invalid_message']);
+  assert.equal(client.state.connection, 'disconnected');
 });

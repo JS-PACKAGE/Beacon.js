@@ -1,10 +1,12 @@
 import type { ClientMessage, Compatibility, RoomSettings } from '../protocol/index.js';
 export type { ClientMessage as BeaconCommand } from '../protocol/index.js';
+import type { ServerMessage, BeaconMessageOf, BeaconPlayer, BeaconFriend, BeaconParty, BeaconInvitation, BeaconQueue, BeaconProposal, BeaconMatchResult } from './protocol.js';
+import { isServerMessage } from './validation.js';
+export type * from './protocol.js';
 export type BeaconRoomFilters = Omit<Extract<ClientMessage, { type: 'list_rooms' }>, 'type' | 'requestId'>;
 export type BeaconRoomInput = RoomSettings & Compatibility & { name: string };
-
-export interface BeaconPlayer { readonly id: string; readonly displayName: string }
-export type BeaconMessage = Readonly<Record<string, unknown>> & { readonly type: string };
+export type BeaconMessage = ServerMessage;
+type WireMessage = Readonly<Record<string, unknown>> & { readonly type: string };
 export interface BeaconSocket {
   readonly readyState: number;
   send(data: string): void;
@@ -30,14 +32,24 @@ export interface RequestOptions {
   timeoutMs?: number;
   /** Retain the exact request and ID until its deadline; the server deduplicates it. */
   retryOnReconnect?: boolean;
+  /** Cancels local waiting only; an already sent command can still commit on the server. */
+  signal?: AbortSignal;
 }
-export interface BeaconResult { requestId: string; messages: readonly BeaconMessage[] }
+export interface BeaconResult { requestId: string; messages: readonly BeaconMessage[]; get<K extends BeaconMessage['type']>(type: K): BeaconMessageOf<K> | undefined }
 export interface BeaconState {
   connection: 'disconnected' | 'connecting' | 'authenticating' | 'connected' | 'reconnecting';
   player: BeaconPlayer | null;
-  session: BeaconMessage | null;
-  lobby: BeaconMessage | null;
-  room: BeaconMessage | null;
+  session: BeaconMessageOf<'session_state'> | null;
+  lobby: BeaconMessageOf<'lobby_state'> | null;
+  room: BeaconMessageOf<'room_joined' | 'room_state' | 'session_state'> | null;
+  friends: Readonly<Record<string, BeaconFriend>>;
+  party: BeaconParty | null;
+  invitations: Readonly<Record<string, BeaconInvitation>>;
+  blocks: readonly string[];
+  queue: BeaconQueue;
+  proposal: BeaconProposal | null;
+  /** Pending private results only; acknowledged history remains available in request responses. */
+  results: Readonly<Record<string, BeaconMatchResult>>;
 }
 export class BeaconError extends Error {
   constructor(public readonly code: string, public readonly requestId?: string) {
@@ -45,21 +57,26 @@ export class BeaconError extends Error {
     this.name = 'BeaconError';
   }
 }
+export type BeaconEvents = { [K in BeaconMessage['type']]: BeaconMessageOf<K> } & {
+  state: Readonly<BeaconState>; connected: Readonly<BeaconState>; disconnected: Readonly<BeaconState>;
+  message: BeaconMessage; error: BeaconError;
+};
 type Listener = (value: unknown) => void;
 type Pending = {
   wire: string; command: string; retry: boolean; clearsRoom: boolean; messages: BeaconMessage[]; bytes: number;
   resynced?: boolean;
   resolve: (result: BeaconResult) => void; reject: (error: BeaconError) => void;
-  timer: NodeJS.Timeout;
+  timer: ReturnType<typeof setTimeout>;
+  signal?: AbortSignal; abort?: () => void;
 };
-type Assembly = { base: BeaconMessage; field: 'members' | 'rooms' | 'friends' | 'games' | 'partyMembers' | 'payload'; parts: Map<number, unknown[]>; count: number; bytes: number; timer: NodeJS.Timeout };
+type Assembly = { base: WireMessage; field: 'members' | 'rooms' | 'friends' | 'games' | 'partyMembers' | 'payload'; parts: Map<number, unknown[]>; count: number; bytes: number; timer: ReturnType<typeof setTimeout> };
 function record(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
 function positive(value: number, name: string): number {
   if (!Number.isSafeInteger(value) || value < 1) throw new BeaconError(`invalid_${name}`);
   return value;
 }
 
-/** Dependency-free protocol-v2 SDK. Inject a WebSocket constructor on older Node runtimes. */
+/** Dependency-free protocol-v3 SDK. Inject a WebSocket constructor on older Node runtimes. */
 export class BeaconClient {
   private readonly options: BeaconClientOptions;
   private readonly Socket: BeaconSocketConstructor;
@@ -69,10 +86,10 @@ export class BeaconClient {
   private attempts = 0;
   private sequence = 0;
   private readonly prefix: string;
-  private reconnectTimer: NodeJS.Timeout | undefined;
-  private handshakeTimer: NodeJS.Timeout | undefined;
-  private connectTimer: NodeJS.Timeout | undefined;
-  private refreshTimer: NodeJS.Timeout | undefined;
+  private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  private handshakeTimer: ReturnType<typeof setTimeout> | undefined;
+  private connectTimer: ReturnType<typeof setTimeout> | undefined;
+  private refreshTimer: ReturnType<typeof setTimeout> | undefined;
   private readonly pending = new Map<string, Pending>();
   private readonly assemblies = new Map<string, Assembly>();
   private readonly revisions = new Map<string, number>();
@@ -80,7 +97,7 @@ export class BeaconClient {
   private connecting: Promise<void> | undefined;
   private connectResolve: (() => void) | undefined;
   private connectReject: ((error: BeaconError) => void) | undefined;
-  private current: BeaconState = { connection: 'disconnected', player: null, session: null, lobby: null, room: null };
+  private current: BeaconState = { connection: 'disconnected', player: null, session: null, lobby: null, room: null, friends: {}, party: null, invitations: {}, blocks: [], queue: { queued: false }, proposal: null, results: {} };
 
   constructor(options: BeaconClientOptions) {
     const url = new URL(options.url);
@@ -99,11 +116,12 @@ export class BeaconClient {
     this.prefix = globals.crypto?.randomUUID() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
   }
   get state(): Readonly<BeaconState> { return { ...this.current }; }
-  on(event: string, listener: Listener): () => void {
+  on<K extends keyof BeaconEvents>(event: K, listener: (value: BeaconEvents[K]) => void): () => void {
+    const callback = listener as Listener;
     let listeners = this.listeners.get(event);
     if (!listeners) { listeners = new Set(); this.listeners.set(event, listeners); }
-    listeners.add(listener);
-    return () => { listeners.delete(listener); if (!listeners.size) this.listeners.delete(event); };
+    listeners.add(callback);
+    return () => { listeners.delete(callback); if (!listeners.size) this.listeners.delete(event); };
   }
   private emit(event: string, value: unknown): void {
     for (const listener of this.listeners.get(event) ?? []) {
@@ -143,9 +161,9 @@ export class BeaconClient {
       try {
         if (typeof event.data !== 'string' || new TextEncoder().encode(event.data).byteLength > this.options.maxMessageBytes!) throw new BeaconError('invalid_message');
         const message: unknown = JSON.parse(event.data);
-        if (!record(message) || typeof message.type !== 'string') throw new BeaconError('invalid_message');
-        this.receive(message as BeaconMessage);
-      } catch { this.emit('error', new BeaconError('invalid_message')); socket.close(1002, 'Invalid protocol message'); }
+        if (!isServerMessage(message)) throw new BeaconError('invalid_message');
+        this.receive(message as unknown as WireMessage);
+      } catch { this.emit('error', new BeaconError('invalid_message')); socket.close(4002, 'Invalid protocol message'); }
     });
     socket.addEventListener('error', () => {
       if (this.socket !== socket) return;
@@ -164,7 +182,7 @@ export class BeaconClient {
       const token = await this.getToken();
       if (this.socket !== socket || this.stopped) return;
       if (!token) throw new BeaconError('token_unavailable');
-      await this.sendRequest({ type: 'auth', token, protocolVersion: 2 }, {}, true);
+      await this.sendRequest({ type: 'auth', token, protocolVersion: 3 }, {}, true);
       if (this.socket !== socket || this.stopped) return;
       clearTimeout(this.handshakeTimer); this.handshakeTimer = undefined;
       clearTimeout(this.connectTimer); this.connectTimer = undefined;
@@ -183,6 +201,7 @@ export class BeaconClient {
     return this.sendRequest(message, options, false);
   }
   private sendRequest(message: ClientMessage, options: RequestOptions, internal: boolean): Promise<BeaconResult> {
+    if (options.signal?.aborted) return Promise.reject(new BeaconError('aborted', options.requestId ?? message.requestId));
     const requestId = options.requestId ?? message.requestId ?? `${this.prefix}:${++this.sequence}`;
     if (!requestId || requestId.length > 128 || this.pending.has(requestId)) return Promise.reject(new BeaconError('invalid_request_id', requestId));
     if ((!this.ready && !internal) || this.socket?.readyState !== 1) return Promise.reject(new BeaconError('disconnected', requestId));
@@ -192,31 +211,35 @@ export class BeaconClient {
     try { wire = JSON.stringify({ ...message, requestId }); } catch { return Promise.reject(new BeaconError('invalid_request', requestId)); }
     if (new TextEncoder().encode(wire).byteLength > 4096) return Promise.reject(new BeaconError('request_too_large', requestId));
     return new Promise<BeaconResult>((resolve, reject) => {
-      const timer = setTimeout(() => { this.pending.delete(requestId); reject(new BeaconError('timeout', requestId)); }, timeout);
-      this.pending.set(requestId, { wire, command: message.type, retry: options.retryOnReconnect === true, clearsRoom: message.type === 'leave_room' || message.type === 'switch_game' || message.type === 'select_game' || (message.type === 'delete_room' && message.roomId === undefined), messages: [], bytes: 0, resolve, reject, timer });
+      const timer = setTimeout(() => this.finish(requestId, new BeaconError('timeout', requestId)), timeout);
+      const abort = () => this.finish(requestId, new BeaconError('aborted', requestId));
+      this.pending.set(requestId, { wire, command: message.type, retry: options.retryOnReconnect === true, clearsRoom: message.type === 'leave_room' || message.type === 'switch_game' || message.type === 'select_game' || (message.type === 'delete_room' && message.roomId === undefined), messages: [], bytes: 0, resolve, reject, timer, ...(options.signal ? { signal: options.signal, abort } : {}) });
+      options.signal?.addEventListener('abort', abort, { once: true });
+      if (options.signal?.aborted) { abort(); return; }
       try { this.socket!.send(wire); } catch { this.finish(requestId, new BeaconError('disconnected', requestId)); }
     });
   }
-  private snapshotRevision(message: BeaconMessage): number | undefined {
+  private snapshotRevision(message: WireMessage): number | undefined {
     if ((message.type === 'lobby_state' || message.type === 'lobby_update') && typeof message.lobbyRevision === 'number') return message.lobbyRevision;
     return typeof message.revision === 'number' ? message.revision : record(message.room) && typeof message.room.revision === 'number' ? message.room.revision : typeof message.lobbyRevision === 'number' ? message.lobbyRevision : undefined;
   }
   private finish(requestId: string, error?: BeaconError): void {
     const entry = this.pending.get(requestId); if (!entry) return;
-    clearTimeout(entry.timer); this.pending.delete(requestId);
+    clearTimeout(entry.timer); entry.signal?.removeEventListener('abort', entry.abort!); this.pending.delete(requestId);
+    for (const [key, assembly] of this.assemblies) if (assembly.base.requestId === requestId) { clearTimeout(assembly.timer); this.assemblies.delete(key); }
     if (!error && !entry.resynced && entry.clearsRoom) {
       this.current = { ...this.current, room: null }; this.emit('state', this.state);
     }
-    if (error) entry.reject(error); else entry.resolve({ requestId, messages: entry.messages });
+    if (error) entry.reject(error); else entry.resolve({ requestId, messages: entry.messages, get: <K extends BeaconMessage['type']>(type: K) => entry.messages.find(message => message.type === type) as BeaconMessageOf<K> | undefined });
   }
-  private receive(message: BeaconMessage): void {
+  private receive(message: WireMessage): void {
     const requestId = typeof message.requestId === 'string' ? message.requestId : undefined;
     if (message.type === 'result') {
       if (requestId && message.ok === true && message.resyncRequired === true) {
         const original = this.pending.get(requestId);
         if (!original) return;
         if (original.command === 'sync_state') { this.finish(requestId, new BeaconError('invalid_snapshot', requestId)); return; }
-        void this.sendRequest({ type: 'sync_state' }, {}, true).then(result => {
+        void this.sendRequest({ type: 'sync_state' }, original.signal ? { signal: original.signal } : {}, true).then(result => {
           if (this.pending.get(requestId) !== original) return;
           if (!original.messages.length) original.messages = [...result.messages];
           original.resynced = true;
@@ -238,8 +261,10 @@ export class BeaconClient {
       if (requestId) this.finish(requestId, error); else { this.emit('error', error); if (message.type === 'auth_fail') this.stop(error); }
       return;
     }
+    if (requestId && !this.pending.has(requestId)) return;
     const complete = this.assemble(message);
     if (!complete) return;
+    if (!isServerMessage(complete)) throw new BeaconError('invalid_message');
     if (requestId) {
       const pending = this.pending.get(requestId);
       if (pending) pending.bytes += new TextEncoder().encode(JSON.stringify(complete)).byteLength;
@@ -251,14 +276,14 @@ export class BeaconClient {
     this.emit('message', complete);
     if (complete.replayed !== true) this.emit(complete.type, complete);
   }
-  private scope(message: BeaconMessage): string {
+  private scope(message: WireMessage): string {
     if (message.type === 'snapshot_chunk' && typeof message.snapshotType === 'string') return `snapshot:${message.snapshotType}`;
     if (message.type === 'lobby_state' || message.type === 'lobby_update') return 'lobby';
     if (record(message.party) && typeof message.party.id === 'string') return `party:${message.party.id}`;
     const room = record(message.room) ? message.room : undefined;
     return typeof room?.id === 'string' ? `room:${room.id}` : typeof message.roomId === 'string' ? `room:${message.roomId}` : message.type;
   }
-  private assemble(message: BeaconMessage): BeaconMessage | undefined {
+  private assemble(message: WireMessage): WireMessage | undefined {
     const scope = this.scope(message);
     const revision = this.snapshotRevision(message);
     if (revision !== undefined && (!Number.isSafeInteger(revision) || revision < 0)) throw new BeaconError('invalid_snapshot');
@@ -300,9 +325,11 @@ export class BeaconClient {
     return { ...base, type: assembly.base.type, [field]: values };
   }
   private update(message: BeaconMessage): void {
-    const revision = this.snapshotRevision(message);
-    if (revision !== undefined && revision < (this.revisions.get(this.scope(message)) ?? -1)) return;
+    const wire = message as unknown as WireMessage;
+    const revision = this.snapshotRevision(wire);
+    if (revision !== undefined && revision < (this.revisions.get(this.scope(wire)) ?? -1)) return;
     if (message.type === 'auth_ok' || message.type === 'auth_refreshed') {
+      if (message.type === 'auth_ok') this.current = { ...this.current, friends: {}, party: null, invitations: {}, blocks: [], queue: { queued: false }, proposal: null, results: {} };
       const player = message.player;
       if (record(player) && typeof player.id === 'string' && typeof player.displayName === 'string') this.current = { ...this.current, player: { id: player.id, displayName: player.displayName } };
       clearTimeout(this.refreshTimer); this.refreshTimer = undefined;
@@ -323,14 +350,56 @@ export class BeaconClient {
       const existing = Array.isArray(this.current.lobby.rooms) ? this.current.lobby.rooms : [];
       const rooms = existing.filter(item => !record(item) || item.id !== room.id);
       if (message.change !== 'remove') rooms.push(room);
-      this.current = { ...this.current, lobby: { ...this.current.lobby, rooms, lobbyRevision: message.lobbyRevision, revision: message.lobbyRevision } };
+      this.current = { ...this.current, lobby: { ...this.current.lobby, rooms, ...(message.lobbyRevision !== undefined ? { lobbyRevision: message.lobbyRevision, revision: message.lobbyRevision } : {}) } };
     }
-    if (['room_joined', 'room_state', 'room_update', 'room_members'].includes(message.type)) this.current = { ...this.current, room: message };
+    if (message.type === 'room_joined' || message.type === 'room_state') this.current = { ...this.current, room: message };
     if (message.type === 'room_closed' || message.type === 'room_left') {
       const closedId = typeof message.roomId === 'string' ? message.roomId : undefined;
       const current = this.current.room;
-      const currentId = current && typeof current.roomId === 'string' ? current.roomId : current && record(current.room) && typeof current.room.id === 'string' ? current.room.id : undefined;
+      const currentId = current?.room?.id;
       if (!closedId || !currentId || closedId === currentId) this.current = { ...this.current, room: null };
+    }
+    if (message.type === 'friends') this.current = { ...this.current, friends: Object.fromEntries(message.friends.map(friend => [friend.playerId, friend])) };
+    if (message.type === 'friend_presence') {
+      const friend = this.current.friends[message.playerId];
+      if (friend) {
+        const { gameId: _gameId, ...previous } = friend;
+        this.current = { ...this.current, friends: { ...this.current.friends, [message.playerId]: { ...previous, online: message.online, ...(message.gameId ? { gameId: message.gameId } : {}) } } };
+      }
+    }
+    if (message.type === 'party_state') this.current = { ...this.current, party: message.party };
+    if (message.type === 'party_left') this.current = { ...this.current, party: null };
+    if (message.type === 'blocks') this.current = { ...this.current, blocks: message.playerIds };
+    if (message.type === 'invitations') this.current = { ...this.current, invitations: { ...this.current.invitations, ...Object.fromEntries(message.invitations.map(invitation => [invitation.invitationToken, invitation])) } };
+    if (message.type === 'room_invitation' || message.type === 'party_invitation') {
+      const invitation: BeaconInvitation = { invitationToken: message.invitationToken, target: message.playerId, expiresAt: message.expiresAt, status: 'pending', ...(message.sender ? { sender: message.sender } : {}), ...(message.createdAt !== undefined ? { createdAt: message.createdAt } : {}), ...(message.type === 'room_invitation' ? { roomId: message.roomId } : { partyId: message.partyId }) };
+      this.current = { ...this.current, invitations: { ...this.current.invitations, [invitation.invitationToken]: invitation } };
+    }
+    if (message.type === 'invitation_resolved') {
+      const invitations = { ...this.current.invitations }; delete invitations[message.invitationToken];
+      this.current = { ...this.current, invitations };
+    }
+    if (message.type === 'queue_state') this.current = { ...this.current, queue: { queued: message.queued, ...(message.queueId ? { queueId: message.queueId } : {}), ...(message.expiresAt !== undefined ? { expiresAt: message.expiresAt } : {}), ...(message.reason ? { reason: message.reason } : {}) } };
+    if (message.type === 'match_proposal') this.current = { ...this.current, proposal: { proposalId: message.proposalId, deadline: message.deadline, members: message.members, accepted: message.accepted } };
+    if (message.type === 'match_proposal_resolved' && message.reason !== 'accepted' && this.current.proposal?.proposalId === message.proposalId) this.current = { ...this.current, proposal: null };
+    if (message.type === 'match_found') this.current = { ...this.current, proposal: null, queue: { queued: false, reason: 'matched' } };
+    if (message.type === 'match_result') {
+      const { type: _type, requestId: _requestId, replayed: _replayed, ...result } = message;
+      const results = { ...this.current.results };
+      if (result.acknowledgedAt === undefined) results[result.resultId] = result;
+      else delete results[result.resultId];
+      this.current = { ...this.current, results };
+    }
+    if (message.type === 'match_results') {
+      const results = { ...this.current.results };
+      for (const result of message.results) {
+        if (result.acknowledgedAt === undefined) results[result.resultId] = result;
+        else delete results[result.resultId];
+      }
+      this.current = { ...this.current, results };
+    }
+    if (message.type === 'match_result_acked') {
+      const results = { ...this.current.results }; delete results[message.resultId]; this.current = { ...this.current, results };
     }
     this.emit('state', this.state);
   }
@@ -363,7 +432,7 @@ export class BeaconClient {
   }
   disconnect(): void { this.stop(new BeaconError('disconnected')); }
   private async getToken(): Promise<string> {
-    let timer: NodeJS.Timeout | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       return await Promise.race([
         Promise.resolve().then(() => this.options.token()),
@@ -372,42 +441,57 @@ export class BeaconClient {
     } catch (error) { throw error instanceof BeaconError ? error : new BeaconError('token_unavailable'); }
     finally { clearTimeout(timer); }
   }
-  async refreshAuth(): Promise<BeaconResult> {
-    let token: string;
-    token = await this.getToken();
+  async refreshAuth(requestOptions: RequestOptions = {}): Promise<BeaconResult> {
+    if (requestOptions.signal?.aborted) throw new BeaconError('aborted');
+    const token = await this.getToken();
     if (!token) throw new BeaconError('token_unavailable');
-    return this.request({ type: 'refresh_auth', token });
+    return this.request({ type: 'refresh_auth', token }, requestOptions);
   }
-  syncState(): Promise<BeaconResult> { return this.request({ type: 'sync_state' }); }
-  selectGame(gameId: string, compatibility: Compatibility = {}): Promise<BeaconResult> { return this.request({ type: 'select_game', gameId, ...compatibility }); }
-  listRooms(filters: BeaconRoomFilters = {}): Promise<BeaconResult> { return this.request({ ...filters, type: 'list_rooms' }); }
-  createRoom(input: BeaconRoomInput): Promise<BeaconResult> { return this.request({ ...input, type: 'create_room' }); }
-  joinRoom(roomId: string, options: { password?: string; role?: 'player' | 'spectator'; invitationToken?: string } = {}): Promise<BeaconResult> { return this.request({ type: 'join_room', roomId, ...options }); }
-  leaveRoom(): Promise<BeaconResult> { return this.request({ type: 'leave_room' }); }
-  deleteRoom(roomId?: string): Promise<BeaconResult> { return this.request(roomId === undefined ? { type: 'delete_room' } : { type: 'delete_room', roomId }); }
-  setReady(ready: boolean): Promise<BeaconResult> { return this.request({ type: 'ready', ready }); }
-  startGame(): Promise<BeaconResult> { return this.request({ type: 'start_game' }); }
-  ping(): Promise<BeaconResult> { return this.request({ type: 'ping' }); }
-  updateRoom(settings: RoomSettings): Promise<BeaconResult> { return this.request({ type: 'update_room', ...settings }); }
-  kickPlayer(playerId: string, ban = false): Promise<BeaconResult> { return this.request({ type: 'kick_player', playerId, ...(ban ? { ban } : {}) }); }
-  unbanPlayer(playerId: string): Promise<BeaconResult> { return this.request({ type: 'unban_player', playerId }); }
-  transferHost(playerId: string): Promise<BeaconResult> { return this.request({ type: 'transfer_host', playerId }); }
-  invitePlayer(playerId: string): Promise<BeaconResult> { return this.request({ type: 'invite_player', playerId }); }
-  quickJoin(filters: BeaconRoomFilters & { password?: string } = {}): Promise<BeaconResult> { return this.request({ ...filters, type: 'quick_join' }); }
-  queueJoin(options: { minPlayers?: number; maxPlayers?: number } & Compatibility = {}): Promise<BeaconResult> { return this.request({ ...options, type: 'queue_join' }); }
-  queueLeave(): Promise<BeaconResult> { return this.request({ type: 'queue_leave' }); }
-  partyCreate(): Promise<BeaconResult> { return this.request({ type: 'party_create' }); }
-  partyInvite(playerId: string): Promise<BeaconResult> { return this.request({ type: 'party_invite', playerId }); }
-  partyAccept(invitationToken: string): Promise<BeaconResult> { return this.request({ type: 'party_accept', invitationToken }); }
-  partyLeave(): Promise<BeaconResult> { return this.request({ type: 'party_leave' }); }
-  friendRequest(playerId: string): Promise<BeaconResult> { return this.request({ type: 'friend_request', playerId }); }
-  friendRespond(playerId: string, accept: boolean): Promise<BeaconResult> { return this.request({ type: 'friend_respond', playerId, accept }); }
-  friendRemove(playerId: string): Promise<BeaconResult> { return this.request({ type: 'friend_remove', playerId }); }
-  listFriends(): Promise<BeaconResult> { return this.request({ type: 'list_friends' }); }
-  switchGame(gameId: string, compatibility: Compatibility = {}): Promise<BeaconResult> { return this.request({ type: 'switch_game', gameId, ...compatibility }); }
-  listGames(): Promise<BeaconResult> { return this.request({ type: 'list_games' }); }
-  listOwnedRooms(): Promise<BeaconResult> { return this.request({ type: 'list_owned_rooms' }); }
-  blockPlayer(playerId: string): Promise<BeaconResult> { return this.request({ type: 'block_player', playerId }); }
-  unblockPlayer(playerId: string): Promise<BeaconResult> { return this.request({ type: 'unblock_player', playerId }); }
-  listBlocks(): Promise<BeaconResult> { return this.request({ type: 'list_blocks' }); }
+  syncState(options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'sync_state' }, options); }
+  selectGame(gameId: string, compatibility: Compatibility = {}, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'select_game', gameId, ...compatibility }, options); }
+  listRooms(filters: BeaconRoomFilters = {}, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ ...filters, type: 'list_rooms' }, options); }
+  createRoom(input: BeaconRoomInput, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ ...input, type: 'create_room' }, options); }
+  joinRoom(roomId: string, input: { password?: string; role?: 'player' | 'spectator'; invitationToken?: string } = {}, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'join_room', roomId, ...input }, options); }
+  leaveRoom(options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'leave_room' }, options); }
+  deleteRoom(roomId?: string, options: RequestOptions = {}): Promise<BeaconResult> { return this.request(roomId === undefined ? { type: 'delete_room' } : { type: 'delete_room', roomId }, options); }
+  setReady(ready: boolean, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'ready', ready }, options); }
+  startGame(options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'start_game' }, options); }
+  ping(options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'ping' }, options); }
+  updateRoom(settings: RoomSettings, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'update_room', ...settings }, options); }
+  kickPlayer(playerId: string, ban = false, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'kick_player', playerId, ...(ban ? { ban } : {}) }, options); }
+  unbanPlayer(playerId: string, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'unban_player', playerId }, options); }
+  transferHost(playerId: string, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'transfer_host', playerId }, options); }
+  invitePlayer(playerId: string, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'invite_player', playerId }, options); }
+  quickJoin(filters: BeaconRoomFilters & { password?: string } = {}, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ ...filters, type: 'quick_join' }, options); }
+  queueJoin(input: Omit<Extract<ClientMessage, { type: 'queue_join' }>, 'type' | 'requestId'> = {}, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ ...input, type: 'queue_join' }, options); }
+  queueLeave(options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'queue_leave' }, options); }
+  matchAccept(proposalId: string, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'match_accept', proposalId }, options); }
+  matchDecline(proposalId: string, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'match_decline', proposalId }, options); }
+  partyCreate(options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'party_create' }, options); }
+  partyInvite(playerId: string, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'party_invite', playerId }, options); }
+  partyAccept(invitationToken: string, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'party_accept', invitationToken }, options); }
+  partyLeave(options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'party_leave' }, options); }
+  partyTransferLeader(playerId: string, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'party_transfer_leader', playerId }, options); }
+  partyKick(playerId: string, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'party_kick', playerId }, options); }
+  partyDisband(options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'party_disband' }, options); }
+  partyJoinRoom(roomId: string, input: { password?: string; invitationToken?: string } = {}, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'party_join_room', roomId, ...input }, options); }
+  friendRequest(playerId: string, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'friend_request', playerId }, options); }
+  friendRespond(playerId: string, accept: boolean, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'friend_respond', playerId, accept }, options); }
+  friendRemove(playerId: string, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'friend_remove', playerId }, options); }
+  listFriends(options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'list_friends' }, options); }
+  switchGame(gameId: string, compatibility: Compatibility = {}, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'switch_game', gameId, ...compatibility }, options); }
+  listGames(options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'list_games' }, options); }
+  listOwnedRooms(options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'list_owned_rooms' }, options); }
+  blockPlayer(playerId: string, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'block_player', playerId }, options); }
+  unblockPlayer(playerId: string, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'unblock_player', playerId }, options); }
+  listBlocks(options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'list_blocks' }, options); }
+  listInvitations(direction?: 'incoming' | 'outgoing', options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'list_invitations', ...(direction ? { direction } : {}) }, options); }
+  declineInvitation(invitationToken: string, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'decline_invitation', invitationToken }, options); }
+  revokeInvitation(invitationToken: string, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'revoke_invitation', invitationToken }, options); }
+  listMatchResults(input: { cursor?: string; limit?: number } = {}, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'list_match_results', ...input }, options); }
+  ackMatchResult(resultId: string, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'ack_match_result', resultId }, options); }
+  chatSend(scope: 'room' | 'party', text: string, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'chat_send', scope, text }, options); }
+  chatHistory(scope: 'room' | 'party', input: { cursor?: string; limit?: number } = {}, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'chat_history', scope, ...input }, options); }
+  chatMute(scope: 'room' | 'party', playerId: string, until: number, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'chat_mute', scope, playerId, until }, options); }
+  chatReport(messageId: string, reason: string, options: RequestOptions = {}): Promise<BeaconResult> { return this.request({ type: 'chat_report', messageId, reason }, options); }
 }

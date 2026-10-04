@@ -52,7 +52,7 @@ try {
   token = '';
   if (typeof hello?.serverVersion !== 'string' || !(hello.authDeadlineMs > 0)) throw new Error('Invalid hello');
   if (typeof client.state.player?.id !== 'string') throw new Error('Invalid auth_ok');
-  console.log('PASS hello / real-token auth_ok / protocol v2 sync');
+  console.log('PASS hello / real-token auth_ok / protocol v3 sync');
   const selected = await client.selectGame(gameId);
   const lobby = response(selected, 'lobby_state');
   if (lobby.game?.gameId !== gameId || !Number.isSafeInteger(lobby.game.maxPlayersPerRoom) || lobby.game.maxPlayersPerRoom < 1 || !Array.isArray(lobby.rooms)) throw new Error('Invalid game lobby');
