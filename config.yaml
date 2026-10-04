@@ -83,7 +83,7 @@
     "messageBurst": 20, # 每連線訊息 token bucket 容量
     "messageWindowMs": 10000, # 訊息配額完整補充所需毫秒
     "maxRateViolations": 3, # 連續超過訊息配額幾次後斷線
-    "passwordFailures": 5, # 每連線每個時間窗允許的錯誤密碼次數
+    "passwordFailures": 5, # 每位玩家每個時間窗允許的錯誤密碼次數；斷線重連不重置，重啟不保留
     "passwordWindowMs": 60000, # 密碼猜測失敗計數時間窗，毫秒
     "maxRoomsPerGame": 1000, # 每個遊戲可持有的房間數量上限
     "inboundBytes": 4096, # 入站單則訊息上限，bytes；超限斷線

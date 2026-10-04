@@ -27,7 +27,7 @@
    - 若改 `public.tls: direct`（本程序自持憑證、不經隧道），於 `config.yaml` 啟用；本機層仍僅回環。
 2. **驗證前置**：連線 10 秒內未 `auth` 即斷線；`auth_fail` 後斷線；驗證系統不可達 → 拒絕新驗證（fail-closed），不得放行匿名。
 3. **來源與連線配額**：升階請求檢查 `Origin`（白名單，非白名單拒絕，CLI 客戶端可豁免）；每 IP 連線數上限（預設 10）、全服務連線總量上限（預設 5000）、每 IP 新連線頻率限制（預設 5/10 秒）。**來源 IP 判定（防偽造）**：僅當連線來自受信任代理（`config.yaml: server.trustProxy: true` 且 socket remote 為 loopback／設定之代理位址）時，才採 `CF-Connecting-IP` 或 `X-Forwarded-For` 的最右可信值；**其餘一律用 socket remoteAddress——絕不直接信任用戶端可自行偽造的轉送標頭**；`Origin` 檢查在經代理時同理取轉送後實際來源。
-4. **密碼**：房間密碼以 `node:crypto` scrypt（每房隨機 salt）雜湊儲存，常數時間比較（`timingSafeEqual`）；密碼不得出現在日誌、推播、房間列表（列表只回 `hasPassword`）；加入密碼驗證失敗頻率限制（預設 5 次/分鐘/連線，超過回 `rate_limited`）。
+4. **密碼**：房間密碼以 `node:crypto` scrypt（每房隨機 salt）雜湊儲存，常數時間比較（`timingSafeEqual`）；密碼不得出現在日誌、推播、房間列表（列表只回 `hasPassword`）；加入密碼驗證失敗頻率限制（預設 5 次/分鐘/玩家，跨連線、斷線不重置，程序重啟不保留，超過回 `rate_limited`）。
 5. **競態與滿員**：`join_room` 流程＝「同步檢查＋預留名額 → 非同步驗密碼 → 確認或釋放」；密碼驗證期間名額已佔，失敗即釋放——兩客戶端同秒加入不得超過 `maxPlayers`。
 6. **輸入驗證**：每訊息 4 KB 上限；JSON 解析失敗計次，單連線 3 次即斷線；所有欄位過 schema（型別、長度、字元集：房名 1–32 字、禁控制字元）；未知欄位拒絕。
 7. **頻率限制**：每連線 token bucket（預設 20 訊息/10 秒），超限回 `rate_limited`，持續超限斷線。
@@ -35,7 +35,7 @@
 9. **依賴與供應鏈**：依賴最小化（預設僅 `ws`，儲存層 `node:sqlite` 內建）、鎖定 lockfile、CI 跑 `npm audit --omit=dev`；禁止 `eval`/`Function()`、禁止動態 require 使用者輸入。**`data/beacon.db` 權限 0600、與 WAL／-shm 一併保護；資料檔路徑配置於 `config.yaml`**。
 10. **資源防護**：ping/pong 死連線回收、socket `highWaterMark` 與背壓處理（推播佇列過大即踢除該連線）、房間數量上限（預設 1000/遊戲）防止房間表炸裂。
 11. **驗證模式管制（fail-closed）**：`auth.mode: mock` **僅限本地開發與自動化測試**——啟動時若 `mode=mock` 而未帶開發旗標 `--dev-mock-auth`，**拒絕啟動**；正式部署必須為 `jwks` 或 `remote`。**真實 OAuth 未接通前，不得宣稱正式整合驗收通過**（Gate E ⑧）。
-12. **管理介面**：`operations` HTTP 只綁 loopback、**每個端點**（含 health／ready／metrics）都要 bearer 認證，token 來自 0600 一般檔案（拒絕符號連結、過寬權限），以常數時間比對；請求大小與欄位嚴格受限；每項管理操作寫入持久稽核；metrics 只輸出彙總數值，不含玩家 ID、token、ticket。對外網域仍不得提供任何 HTTP 頁面或管理路由。
+12. **管理介面**：`operations` HTTP 只綁 loopback、**每個端點**（含 health／ready／metrics，以及場次回報 `/matches/result`、`/matches/player-result`）都要 bearer 認證，token 來自 0600 一般檔案（拒絕符號連結、過寬權限），以常數時間比對；請求大小與欄位嚴格受限；每項管理操作寫入持久稽核；metrics 只輸出彙總數值，不含玩家 ID、token、ticket。對外網域仍不得提供任何 HTTP 頁面或管理路由。個人場次結果只送給該玩家。
 13. **場次憑證隱私**：遊戲 ticket／admission 只送給**該玩家本人**，不得廣播、不得寫入日誌、不得出現在其他玩家可見的訊息或 metrics；服務 bearer token 與 ticket 同屬 `log` 遮蔽範圍。冪等快取只保存雜湊後的請求內容。
 14. **撤銷 fail-closed**：設定了 `auth.revocationUrl` 就是必要依賴——拉取失敗時拒絕新驗證並中斷現有連線；比對 `revokedBefore` 時缺少簽發時間一律視為已撤銷，**不得以 `authAt`（驗證時間）充當簽發時間**。非 mock 必須另有 0600 的 `revocationTokenFile`，GET 帶 `Authorization: Bearer`；token 不得寫入設定檔或日誌。
 
