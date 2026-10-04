@@ -52,7 +52,6 @@ export interface ReconnectSeat {
   region: string;
   displayName: string;
   expiresAt: number;
-  pendingResult?: { matchId: string; result: Rules };
 }
 export interface StoredRoom {
   id: string;
@@ -84,10 +83,25 @@ export interface StoredRoom {
 export interface Moderation { playerId: string; bannedUntil: number; revokedBefore: number; reason: string }
 export interface SocialLink { a: string; b: string; status: 'pending' | 'accepted'; requestedBy: string }
 export interface StoredParty { id: string; leaderId: string; members: string[] }
-export interface StoredInvitation { token: string; target: string; expiresAt: number; roomId?: string; partyId?: string }
+export interface StoredInvitation { token: string; target: string; sender: string; status: 'pending' | 'accepted' | 'declined' | 'revoked' | 'expired'; createdAt: number; resolvedAt?: number; expiresAt: number; roomId?: string; partyId?: string }
+export interface PlayerResult { resultId: string; matchId: string; playerId: string; roomId: string; result: Rules; createdAt: number; acknowledgedAt?: number }
+export interface MatchIdentity { matchId: string; roomId: string; gameId: string; roster: string[]; createdAt: number; finishedAt?: number; state: 'starting' | 'in_game' | 'ended' | 'failed' }
+export interface ChatMessage { id: string; scope: 'room' | 'party'; scopeId: string; senderId: string; text: string; createdAt: number; recipients: string[] }
+export interface ChatReport { id: string; reporterId: string; message: ChatMessage; reason: string; createdAt: number; status: 'pending' | 'dismiss' | 'mute' | 'ban'; reviewedAt?: number }
+export interface DurableDomain { matches: MatchIdentity[]; results: PlayerResult[]; chat: ChatMessage[]; reports: ChatReport[]; mutes: { scope: 'room' | 'party'; scopeId: string; playerId: string; until: number }[]; queue?: StoredQueueEntry[]; proposals?: StoredProposal[] }
+export interface StoredQueueEntry { id: string; members: string[]; partyId?: string; gameId: string; compatibility: { version: string; mode: string; region: string }; min: number; max: number; at: number; matching: 'basic' | 'advanced'; profiles?: readonly TrustedProfile[]; rolePreferences?: Readonly<Record<string, readonly string[]>> }
+export interface StoredProposal { id: string; entries: StoredQueueEntry[]; game: Game; deadline: number; accepted: string[]; players: MatchRequest['players'] }
 export interface PlayerBlock { playerId: string; targetId: string }
 export interface AuditEvent { at: number; actor: string; action: string; target: string }
 export interface RoomStore {
+  transaction(operation: () => void): void;
+  loadDomain(): DurableDomain;
+  saveDomain(domain: DurableDomain): void;
+  exportSnapshot(): string;
+  importSnapshot(snapshot: string): void;
+  setDurabilityFailureHook(hook: () => void): void;
+  setChangesetHook(hook: (changeset: Uint8Array) => void): void;
+  applyChangeset(changeset: Uint8Array): void;
   load(): StoredRoom[];
   insert(room: StoredRoom): void;
   update(room: StoredRoom): void;

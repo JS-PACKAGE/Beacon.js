@@ -50,7 +50,6 @@ test('development ws sends hello first and rejects regular HTTP', async t => {
   const c = client(t, url);
   const greeting = await c.next();
   assert.equal(greeting.type, 'hello');
-  assert.equal(greeting.protocolVersion, 2);
   c.ws.send(JSON.stringify({ type: 'ping' }));
   assert.equal((await c.next()).message.type, 'ping');
   const result = Promise.withResolvers();

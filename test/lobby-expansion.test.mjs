@@ -13,6 +13,9 @@ async function fixture(t, options = {}, providerOptions = {}) {
   const config = await loadConfig('config.yaml', { mockAuth: true, insecureWs: true });
   Object.assign(config.lobby, { reconnectGraceMs: 1000, maxRoomsPerPlayer: 100 }, options.lobby);
   Object.assign(config.limits, options.limits);
+  Object.assign(config.matching, options.matching);
+  Object.assign(config.games, options.gameConfig);
+  Object.assign(config.chat, options.chat);
   config.room.emptyTtlSec = 0;
   const store = new SqliteRoomStore(join(directory, 'state.db'));
   const calls = { create: [], admit: [], cancel: [], status: [] };
@@ -23,11 +26,11 @@ async function fixture(t, options = {}, providerOptions = {}) {
       if (providerOptions.create) return providerOptions.create(request);
       return { matchId: `match-${request.operationId}`, serverUrl: 'wss://game.example/session', expiresAt: Date.now() + 60000, tickets: Object.fromEntries(request.players.map(player => [player.id, `ticket-${player.id}`])) };
     },
-    async admit(matchId, playerId, role) { calls.admit.push({ matchId, playerId, role }); return { serverUrl: 'wss://game.example/session', ticket: `admission-${playerId}`, expiresAt: Date.now() + 60000 }; },
+    async admit(matchId, playerId, role) { calls.admit.push({ matchId, playerId, role }); if (providerOptions.admit) return providerOptions.admit(matchId, playerId, role); return { serverUrl: 'wss://game.example/session', ticket: `admission-${playerId}`, expiresAt: Date.now() + 60000 }; },
     async status(matchId) { calls.status.push(matchId); return state; },
     async cancel(matchId) { calls.cancel.push(matchId); },
   };
-  const games = { async list() { return options.games ?? [{ gameId: 'game', name: 'Game', enabled: true, maxPlayersPerRoom: 8, source: 'config' }]; } };
+  const games = { async list() { return options.games ?? [{ gameId: 'game', name: 'Game', enabled: true, maxPlayersPerRoom: 8, source: 'config' }]; }, ...(options.profiles ? { profiles: options.profiles } : {}) };
   let manager = new RoomManager(config, store, games, provider);
   t.after(async () => { await manager.close(); store.close(); await rm(directory, { recursive: true, force: true }); });
   const connect = async (id, fields = {}, selectGame = true) => {
@@ -198,13 +201,17 @@ test('FIFO matchmaking never splits a party, persists before membership and canc
   await assert.rejects(bob.command({ type: 'queue_join', minPlayers: 3, maxPlayers: 3 }), code('forbidden'));
   await alice.command({ type: 'queue_join', minPlayers: 3, maxPlayers: 3 });
   assert.equal(f.manager.stats().queuedPlayers, 2); assert.equal(f.store.load().length, 0);
+  await carol.command({ type: 'queue_join', minPlayers: 3, maxPlayers: 3 });
+  const proposal = alice.messages.findLast(message => message.type === 'match_proposal');
+  assert.equal(f.store.load().length, 0);
+  await alice.command({ type: 'match_accept', proposalId: proposal.proposalId }); await bob.command({ type: 'match_accept', proposalId: proposal.proposalId });
   const insert = f.store.insert.bind(f.store); f.store.insert = () => { throw new Error('disk unavailable'); };
-  await assert.rejects(carol.command({ type: 'queue_join', minPlayers: 3, maxPlayers: 3 }), code('storage_error'));
-  assert.equal(f.manager.stats().queuedPlayers, 3); assert.equal(f.store.load().length, 0);
-  f.store.insert = insert; await carol.command({ type: 'queue_leave' }); await carol.command({ type: 'queue_join', minPlayers: 3, maxPlayers: 3 });
+  await assert.rejects(carol.command({ type: 'match_accept', proposalId: proposal.proposalId }), code('storage_error'));
+  assert.equal(f.store.load().length, 0); assert.equal(alice.messages.some(message => message.type === 'match_found'), false);
+  f.store.insert = insert; await carol.command({ type: 'match_accept', proposalId: proposal.proposalId });
   assert.equal(f.store.load().length, 1); assert.equal(f.manager.stats().queuedPlayers, 0);
   const ids = [alice, bob, carol].map(peer => peer.messages.find(message => message.type === 'match_found').room.id); assert.equal(new Set(ids).size, 1);
-  assert.deepEqual(alice.messages.findLast(message => message.type === 'room_state').members.map(member => member.id), ['alice', 'bob', 'carol']);
+  assert.deepEqual(new Set(alice.messages.findLast(message => message.type === 'room_state').members.map(member => member.id)), new Set(['alice', 'bob', 'carol']));
   for (const peer of [alice, bob, carol]) await peer.command({ type: 'leave_room' });
   await alice.command({ type: 'queue_join', minPlayers: 3, maxPlayers: 3 }); bob.closed = true; f.manager.disconnect(bob); await f.manager.settle();
   assert.equal(f.manager.stats().queuedPlayers, 0); assert.equal(alice.messages.findLast(message => message.type === 'queue_state').queued, false);
@@ -318,7 +325,8 @@ test('blocks stop invites, friend requests and matchmaking pairs; seats and part
   await alice.command({ type: 'queue_join', minPlayers: 2, maxPlayers: 2 });
   await bob.command({ type: 'queue_join', minPlayers: 2, maxPlayers: 2 });
   assert.equal(f.manager.stats().queuedPlayers, 2);
-  assert.equal(f.store.load().some(item => item.name === 'Matchmaking'), false);
+  assert.equal(f.store.load().length, 1);
+  assert.equal(alice.messages.some(item => item.type === 'match_proposal'), false);
   await alice.command({ type: 'queue_leave' }); await bob.command({ type: 'queue_leave' });
   await f.restart();
   assert.equal(f.store.listParties().length, 0);
@@ -333,4 +341,268 @@ test('blocks stop invites, friend requests and matchmaking pairs; seats and part
   const party = await again.command({ type: 'sync_state' });
   assert.equal(party.find(message => message.type === 'party_state').party.leaderId, 'alice');
   void room;
+});
+
+test('blocking closes pending social acceptance and invitation inbox survives restart with terminal privacy', async t => {
+  const f = await fixture(t); const alice = await f.connect('alice'); const bob = await f.connect('bob');
+  await alice.command({ type: 'friend_request', playerId: 'bob' }); await alice.command({ type: 'party_create' });
+  const invitation = (await alice.command({ type: 'party_invite', playerId: 'bob' })).find(item => item.type === 'party_invitation');
+  await f.restart(); const a = await f.connect('alice'); const b = await f.connect('bob');
+  assert.equal((await b.command({ type: 'list_invitations' }))[0].invitations[0].invitationToken, invitation.invitationToken);
+  await a.command({ type: 'block_player', playerId: 'bob' });
+  await assert.rejects(b.command({ type: 'friend_respond', playerId: 'alice', accept: true }), code('forbidden'));
+  await assert.rejects(b.command({ type: 'party_accept', invitationToken: invitation.invitationToken }), code('invitation_expired'));
+  assert.equal(f.store.listInvitations()[0].status, 'revoked');
+  assert.equal((await b.command({ type: 'list_invitations', direction: 'outgoing' }))[0].invitations.length, 0);
+});
+
+test('private results remain immutable after room deletion and restart; ACK survives reconnect', async t => {
+  const f = await fixture(t); const alice = await f.connect('alice'); await create(alice);
+  await alice.command({ type: 'ready', ready: true }); await alice.command({ type: 'start_game' });
+  const matchId = alice.messages.findLast(item => item.type === 'game_started').matchId;
+  await f.manager.reportMatch(matchId, 'ended'); await alice.command({ type: 'delete_room' }); await f.restart();
+  await f.manager.reportMatch(matchId, 'ended'); await f.manager.reportPlayerResult(matchId, 'alice', { won: true });
+  await f.manager.reportPlayerResult(matchId, 'alice', { won: true });
+  await assert.rejects(f.manager.reportPlayerResult(matchId, 'alice', { won: false }), code('request_conflict'));
+  const restored = await f.connect('alice'); const inbox = (await restored.command({ type: 'list_match_results' }))[0];
+  assert.equal(inbox.results.length, 1); const resultId = inbox.results[0].resultId;
+  await restored.command({ type: 'sync_state' }); await restored.command({ type: 'sync_state' });
+  assert.equal(restored.messages.filter(item => item.type === 'match_result' && item.resultId === resultId).length, 2);
+  await restored.command({ type: 'ack_match_result', resultId }); await f.restart();
+  const next = await f.connect('alice'); await next.command({ type: 'sync_state' });
+  assert.equal(next.messages.some(item => item.type === 'match_result'), false);
+});
+
+test('grouped join failure never splits party and chat is private to original recipients', async t => {
+  const f = await fixture(t); const alice = await f.connect('alice'); const bob = await f.connect('bob'); const carol = await f.connect('carol');
+  const room = await create(carol, { maxPlayers: 3, password: 'secret' });
+  await alice.command({ type: 'party_create' }); const invite = (await alice.command({ type: 'party_invite', playerId: 'bob' })).find(item => item.type === 'party_invitation');
+  await bob.command({ type: 'party_accept', invitationToken: invite.invitationToken });
+  await assert.rejects(alice.command({ type: 'party_join_room', roomId: room.id, password: 'bad' }), code('room_password_incorrect'));
+  assert.equal(f.store.load()[0].seats.length, 1);
+  await alice.command({ type: 'party_join_room', roomId: room.id, password: 'secret' });
+  assert.equal(f.store.load()[0].seats.length, 3);
+  const message = (await alice.command({ type: 'chat_send', scope: 'room', text: 'private' })).find(item => item.type === 'chat_message');
+  await carol.command({ type: 'chat_mute', scope: 'room', playerId: 'alice', until: Date.now() + 1000 });
+  await assert.rejects(alice.command({ type: 'chat_send', scope: 'room', text: 'muted' }), code('chat_muted'));
+  await bob.command({ type: 'chat_report', messageId: message.message.id, reason: 'evidence' });
+  await bob.command({ type: 'block_player', playerId: 'alice' });
+  assert.equal((await bob.command({ type: 'chat_history', scope: 'room' }))[0].messages.length, 0);
+  const outsider = await f.connect('outsider'); await outsider.command({ type: 'select_game', gameId: 'game' });
+  await assert.rejects(outsider.command({ type: 'chat_history', scope: 'room' }), code('room_not_found'));
+});
+
+test('decline drops the entire party; accepted parties requeue at their original age and maintenance rematches without a new join', async t => {
+  const f = await fixture(t);
+  const [a, b, c, d, e, g] = await Promise.all(['a', 'b', 'c', 'd', 'e', 'g'].map(id => f.connect(id)));
+  for (const [leader, member] of [[a, b], [c, d], [e, g]]) {
+    await leader.command({ type: 'party_create' });
+    const invite = (await leader.command({ type: 'party_invite', playerId: member === b ? 'b' : member === d ? 'd' : 'g' })).find(item => item.type === 'party_invitation');
+    await member.command({ type: 'party_accept', invitationToken: invite.invitationToken });
+  }
+  await a.command({ type: 'queue_join', minPlayers: 4, maxPlayers: 4 });
+  const original = f.store.loadDomain().queue[0];
+  await c.command({ type: 'queue_join', minPlayers: 4, maxPlayers: 4 });
+  const proposal = a.messages.findLast(item => item.type === 'match_proposal');
+  await e.command({ type: 'queue_join', minPlayers: 4, maxPlayers: 4 });
+  await c.command({ type: 'match_decline', proposalId: proposal.proposalId });
+  assert.equal(d.messages.findLast(item => item.type === 'queue_state').queued, false);
+  assert.equal(f.store.loadDomain().queue.find(item => item.id === original.id).at, original.at);
+  await f.manager.maintain();
+  const rematch = a.messages.findLast(item => item.type === 'match_proposal');
+  assert.notEqual(rematch.proposalId, proposal.proposalId);
+  assert.deepEqual(new Set(rematch.members), new Set(['a', 'b', 'e', 'g']));
+  assert.equal(f.store.load().length, 0);
+});
+
+test('proposal deadline drops any nonunanimous party and retains accepted party age', async t => {
+  const f = await fixture(t);
+  const [a, b, c] = await Promise.all(['a', 'b', 'c'].map(id => f.connect(id)));
+  await a.command({ type: 'party_create' });
+  const invite = (await a.command({ type: 'party_invite', playerId: 'b' })).find(item => item.type === 'party_invitation');
+  await b.command({ type: 'party_accept', invitationToken: invite.invitationToken });
+  await a.command({ type: 'queue_join', minPlayers: 3, maxPlayers: 3 });
+  const original = f.store.loadDomain().queue[0];
+  await c.command({ type: 'queue_join', minPlayers: 3, maxPlayers: 3 });
+  const proposal = a.messages.findLast(item => item.type === 'match_proposal');
+  await a.command({ type: 'match_accept', proposalId: proposal.proposalId });
+  await b.command({ type: 'match_accept', proposalId: proposal.proposalId });
+  await f.manager.maintain(proposal.deadline);
+  assert.equal(c.messages.findLast(item => item.type === 'queue_state').queued, false);
+  assert.equal(f.store.loadDomain().queue[0].at, original.at);
+  assert.deepEqual(f.store.loadDomain().queue[0].members, ['a', 'b']);
+});
+
+test('search exhaustion preserves queue and game minimum/team counts are skipped instead of crashing', async t => {
+  const game = { gameId: 'game', name: 'Team game', enabled: true, source: 'config', maxPlayersPerRoom: 4, capabilities: { minPlayers: 4, joinPolicies: ['closed'], rules: {}, teams: { count: 2, size: 2, requiredRoles: {} } } };
+  const f = await fixture(t, { games: [game], matching: { searchLimit: 1 } });
+  const peers = await Promise.all(['a', 'b', 'c', 'd'].map(id => f.connect(id)));
+  for (const peer of peers) await peer.command({ type: 'queue_join', minPlayers: 2, maxPlayers: 4 });
+  assert.equal(f.manager.stats().queuedPlayers, 4);
+  assert.equal(peers.some(peer => peer.messages.some(item => item.code === 'matchmaking_search_exhausted')), true);
+  f.config.matching.searchLimit = 100000;
+  await f.manager.maintain();
+  assert.equal(peers[0].messages.findLast(item => item.type === 'match_proposal').members.length, 4);
+});
+
+test('waiting advanced profiles refresh outside serialization and revoked queue identity cannot resurrect', async t => {
+  let now = Date.now(); t.mock.method(Date, 'now', () => now);
+  let calls = 0; let release; let entered;
+  const pending = new Promise(resolve => { entered = resolve; });
+  const f = await fixture(t, { gameConfig: { profileMaxAgeMs: 10 }, profiles: async (_gameId, ids) => {
+    calls++;
+    if (calls > 1) { entered(); await new Promise(resolve => { release = resolve; }); }
+    return ids.map(playerId => ({ playerId, skill: 100, measuredAt: now, regionRttMs: { east: 20 } }));
+  } });
+  const a = await f.connect('a');
+  await a.command({ type: 'switch_game', gameId: 'game', region: 'east' });
+  await a.command({ type: 'queue_join', minPlayers: 2, maxPlayers: 2, matching: 'advanced' });
+  now += 11;
+  const maintenance = f.manager.maintain(now); await pending;
+  await a.command({ type: 'list_blocks' });
+  await a.command({ type: 'queue_leave' }); release(); await maintenance;
+  assert.equal(f.manager.stats().queuedPlayers, 0);
+  assert.equal(f.store.loadDomain().queue.length, 0);
+  assert.equal(a.messages.some(item => item.type === 'match_proposal'), false);
+});
+
+test('missing trusted refresh never downgrades to FIFO and disconnected waiting players cannot match', async t => {
+  let now = Date.now(); t.mock.method(Date, 'now', () => now);
+  let available = true;
+  const f = await fixture(t, { gameConfig: { profileMaxAgeMs: 10 }, profiles: async (_gameId, ids) => {
+    if (!available) throw new Error('profile backend offline');
+    return ids.map(playerId => ({ playerId, skill: playerId === 'a' ? 100 : 1000, measuredAt: now, regionRttMs: { east: 20 } }));
+  } });
+  const a = await f.connect('a'); const b = await f.connect('b');
+  for (const peer of [a, b]) { await peer.command({ type: 'switch_game', gameId: 'game', region: 'east' }); await peer.command({ type: 'queue_join', minPlayers: 2, maxPlayers: 2, matching: 'advanced' }); }
+  now += 11; available = false; await f.manager.maintain(now);
+  assert.equal(f.manager.stats().queuedPlayers, 2);
+  assert.equal(a.messages.findLast(item => item.type === 'error').code, 'profile_unavailable');
+  assert.equal(a.messages.some(item => item.type === 'match_proposal'), false);
+  await a.command({ type: 'queue_leave' }); await b.command({ type: 'queue_leave' });
+  await a.command({ type: 'queue_join', minPlayers: 2, maxPlayers: 2 }); a.closed = true;
+  await b.command({ type: 'queue_join', minPlayers: 2, maxPlayers: 2 }); await f.manager.maintain(now);
+  assert.equal(b.messages.some(item => item.type === 'match_proposal'), false);
+});
+
+test('leader controls and grouped SQL failure are atomic with no leaked join output', async t => {
+  const f = await fixture(t); const a = await f.connect('a'); const b = await f.connect('b'); const host = await f.connect('host');
+  const room = await create(host, { maxPlayers: 3 });
+  await a.command({ type: 'party_create' });
+  const invitation = (await a.command({ type: 'party_invite', playerId: 'b' })).find(item => item.type === 'party_invitation');
+  await b.command({ type: 'party_accept', invitationToken: invitation.invitationToken });
+  await assert.rejects(b.command({ type: 'party_transfer_leader', playerId: 'a' }), code('forbidden'));
+  await assert.rejects(b.command({ type: 'party_join_room', roomId: room.id }), code('forbidden'));
+  const update = f.store.update.bind(f.store); f.store.update = () => { throw new Error('SQL failed'); };
+  const before = [a.messages.length, b.messages.length, host.messages.length];
+  await assert.rejects(a.command({ type: 'party_join_room', roomId: room.id }), code('storage_error'));
+  assert.equal(f.store.load()[0].seats.length, 1);
+  for (const [index, peer] of [a, b, host].entries()) assert.equal(peer.messages.slice(before[index]).some(item => item.type === 'room_joined' || item.type === 'room_state'), false);
+  f.store.update = update;
+  await a.command({ type: 'party_transfer_leader', playerId: 'b' });
+  await b.command({ type: 'party_join_room', roomId: room.id });
+  assert.equal(f.store.load()[0].seats.length, 3);
+  await b.command({ type: 'party_kick', playerId: 'a' });
+  assert.deepEqual(f.store.listParties()[0].members, ['b']);
+  await b.command({ type: 'party_disband' }); assert.equal(f.store.listParties().length, 0);
+});
+
+test('invitation decline/revoke/accept ownership and terminal lifecycle survive restart', async t => {
+  const f = await fixture(t); const a = await f.connect('a'); const b = await f.connect('b'); const outsider = await f.connect('outsider');
+  await a.command({ type: 'party_create' });
+  const issue = async () => (await a.command({ type: 'party_invite', playerId: 'b' })).find(item => item.type === 'party_invitation');
+  const declined = await issue();
+  await assert.rejects(outsider.command({ type: 'decline_invitation', invitationToken: declined.invitationToken }), code('forbidden'));
+  await b.command({ type: 'decline_invitation', invitationToken: declined.invitationToken });
+  await assert.rejects(b.command({ type: 'party_accept', invitationToken: declined.invitationToken }), code('invitation_expired'));
+  const revoked = await issue(); await assert.rejects(b.command({ type: 'revoke_invitation', invitationToken: revoked.invitationToken }), code('forbidden'));
+  await a.command({ type: 'revoke_invitation', invitationToken: revoked.invitationToken });
+  const accepted = await issue(); await b.command({ type: 'party_accept', invitationToken: accepted.invitationToken });
+  await f.restart(); const restored = await f.connect('b');
+  const inbox = (await restored.command({ type: 'list_invitations' }))[0].invitations;
+  assert.equal(inbox.find(item => item.invitationToken === declined.invitationToken).status, 'declined');
+  assert.equal(inbox.find(item => item.invitationToken === revoked.invitationToken).status, 'revoked');
+  assert.equal(inbox.find(item => item.invitationToken === accepted.invitationToken).status, 'accepted');
+  assert.equal((await (await f.connect('outsider')).command({ type: 'list_invitations' }))[0].invitations.length, 0);
+});
+
+test('chat history excludes later members, reports retain private evidence beyond chat retention', async t => {
+  let now = Date.now(); t.mock.method(Date, 'now', () => now);
+  const f = await fixture(t, { chat: { retentionMs: 10, reportRetentionMs: 100 } });
+  const a = await f.connect('a'); const b = await f.connect('b'); const c = await f.connect('c');
+  const room = await create(a); await b.command({ type: 'join_room', roomId: room.id });
+  const sent = (await a.command({ type: 'chat_send', scope: 'room', text: 'private evidence' })).find(item => item.type === 'chat_message');
+  await c.command({ type: 'join_room', roomId: room.id });
+  assert.equal((await c.command({ type: 'chat_history', scope: 'room' }))[0].messages.length, 0);
+  await assert.rejects(c.command({ type: 'chat_report', messageId: sent.message.id, reason: 'not my evidence' }), code('forbidden'));
+  const report = (await b.command({ type: 'chat_report', messageId: sent.message.id, reason: 'review' })).find(item => item.type === 'chat_reported');
+  await assert.rejects(b.command({ type: 'chat_mute', scope: 'room', playerId: 'a', until: now + 100 }), code('forbidden'));
+  now += 11; await f.manager.maintain(now);
+  assert.equal((await b.command({ type: 'chat_history', scope: 'room' }))[0].messages.length, 0);
+  assert.equal(f.manager.chatReport(report.reportId).message.text, 'private evidence');
+  await f.restart(); assert.equal(f.manager.chatReport(report.reportId).message.text, 'private evidence');
+  now += 100; await f.manager.maintain(now); assert.equal(f.manager.chatReport(report.reportId), undefined);
+});
+
+test('trusted proposal assignments reach the provider unchanged and stale acceptance fails closed', async t => {
+  let now = Date.now(); t.mock.method(Date, 'now', () => now);
+  const game = { gameId: 'game', name: 'Team game', enabled: true, source: 'config', maxPlayersPerRoom: 4, regions: ['east'], capabilities: { minPlayers: 4, joinPolicies: ['closed'], rules: {}, roles: ['tank', 'damage'], teams: { count: 2, size: 2, requiredRoles: { tank: 1 } } } };
+  const f = await fixture(t, { games: [game], gameConfig: { profileMaxAgeMs: 100 }, profiles: async (_gameId, ids) => ids.map(playerId => ({ playerId, skill: 100, measuredAt: now, regionRttMs: { east: 20 } })) });
+  const peers = await Promise.all(['a', 'b', 'c', 'd'].map(id => f.connect(id, {}, false)));
+  for (const [index, peer] of peers.entries()) {
+    await peer.command({ type: 'select_game', gameId: 'game', region: 'east' });
+    await peer.command({ type: 'queue_join', matching: 'advanced', minPlayers: 4, maxPlayers: 4, rolePreferences: [index % 2 === 0 ? 'tank' : 'damage'] });
+    now++;
+  }
+  const proposal = peers[0].messages.findLast(item => item.type === 'match_proposal');
+  const assignments = f.store.loadDomain().proposals[0].players;
+  for (const peer of peers.slice(0, 3)) await peer.command({ type: 'match_accept', proposalId: proposal.proposalId });
+  now += 101;
+  await assert.rejects(peers[3].command({ type: 'match_accept', proposalId: proposal.proposalId }), code('profile_unavailable'));
+  assert.equal(f.store.load().length, 0);
+  await peers[3].command({ type: 'match_decline', proposalId: proposal.proposalId });
+  await f.manager.maintain(now);
+  await peers[3].command({ type: 'queue_join', matching: 'advanced', minPlayers: 4, maxPlayers: 4, rolePreferences: ['damage'] });
+  const fresh = peers[0].messages.findLast(item => item.type === 'match_proposal');
+  assert.notEqual(fresh.proposalId, proposal.proposalId);
+  const confirmed = f.store.loadDomain().proposals[0].players;
+  assert.deepEqual(confirmed, assignments);
+  for (const peer of peers) await peer.command({ type: 'match_accept', proposalId: fresh.proposalId });
+  for (const peer of peers) await peer.command({ type: 'ready', ready: true });
+  await peers[0].command({ type: 'start_game' });
+  assert.deepEqual(f.calls.create[0].players, confirmed);
+});
+
+test('read commands bypass mutation snapshots/SQL and maintenance errors roll back durable state and outputs', async t => {
+  const f = await fixture(t); const a = await f.connect('a'); const b = await f.connect('b');
+  const room = await create(a, { visibility: 'invite' });
+  const invitation = (await a.command({ type: 'invite_player', playerId: 'b' })).find(item => item.type === 'room_invitation');
+  const transaction = f.store.transaction.bind(f.store);
+  f.store.transaction = () => { throw new Error('SQL unavailable'); };
+  for (const type of ['list_rooms', 'list_games', 'list_friends', 'list_blocks', 'list_owned_rooms', 'list_invitations', 'list_match_results', 'sync_state']) await a.command({ type });
+  const before = a.messages.length;
+  await assert.rejects(a.command({ type: 'ready', ready: true }), code('storage_error'));
+  assert.equal(a.messages.length, before);
+  f.store.transaction = transaction;
+  const save = f.store.saveInvitation.bind(f.store); f.store.saveInvitation = () => { throw new Error('expiry SQL failed'); };
+  await assert.rejects(f.manager.maintain(invitation.expiresAt), code('storage_error'));
+  assert.equal(f.store.listInvitations()[0].status, 'pending');
+  assert.equal((await b.command({ type: 'list_invitations' }))[0].invitations[0].status, 'pending');
+  f.store.saveInvitation = save;
+  await f.manager.maintain(invitation.expiresAt);
+  assert.equal(f.store.listInvitations()[0].status, 'expired');
+  assert.equal(room.visibility, 'invite');
+});
+
+test('late transport disconnect after manager shutdown cannot write to a disposed store', async t => {
+  const f = await fixture(t); const a = await f.connect('a'); await create(a);
+  await f.manager.close();
+  const persisted = f.store.load();
+  const transaction = f.store.transaction.bind(f.store); let writes = 0;
+  f.store.transaction = () => { writes++; throw new Error('store already disposed'); };
+  try {
+    a.closed = true; f.manager.disconnect(a); await f.manager.settle();
+    assert.equal(writes, 0);
+    assert.deepEqual(f.store.load(), persisted);
+  } finally { f.store.transaction = transaction; }
 });

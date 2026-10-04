@@ -1,5 +1,6 @@
 import type { Rules } from '../types.js';
-export const PROTOCOL_VERSION = 2;
+export type { ServerMessage } from '../client/protocol.js';
+export const PROTOCOL_VERSION = 3;
 export const ERROR_MESSAGES = {
   auth_required: 'Authentication is required', auth_failed: 'Authentication failed', auth_expired: 'Authentication expired',
   game_not_found: 'Game is unavailable', not_in_lobby: 'Select a game first', room_not_found: 'Room is unavailable',
@@ -13,6 +14,10 @@ export const ERROR_MESSAGES = {
   maintenance: 'Server is in maintenance', request_conflict: 'Request identifier was reused with different input',
   not_in_party: 'Join a party first', party_full: 'Party is full', queue_timeout: 'Matchmaking timed out',
   token_revoked: 'Authentication was revoked', unsupported_protocol: 'Unsupported protocol version', snapshot_expired: 'Snapshot expired; request a new snapshot',
+  chat_muted: 'Chat is muted', profile_unavailable: 'Trusted matchmaking profiles are unavailable',
+  matchmaking_search_exhausted: 'Matchmaking search work limit reached; queue is preserved',
+  cluster_unavailable: 'Cluster authority is unavailable', storage_full: 'Durable storage capacity exceeded', request_capacity: 'Request capacity exceeded',
+  request_indeterminate: 'Request outcome is unknown; do not replay', request_id_required: 'A durable request identifier is required',
 } as const;
 export type ErrorCode = keyof typeof ERROR_MESSAGES;
 export function errorMessage(code: ErrorCode): Record<string, unknown> { return { type: 'error', code, message: ERROR_MESSAGES[code] }; }
@@ -37,7 +42,7 @@ export function readRules(value: unknown): Rules {
     if (typeof item === 'string') {
       if ([...item].length > 128 || /[\p{Cc}\p{Cs}]/u.test(item)) throw new Error('Invalid rules');
       rules[key] = item;
-    } else if (typeof item === 'boolean' || (typeof item === 'number' && Number.isSafeInteger(item))) rules[key] = item;
+    } else if (typeof item === 'boolean' || (typeof item === 'number' && Number.isFinite(item) && Math.abs(item) <= Number.MAX_SAFE_INTEGER)) rules[key] = item;
     else throw new Error('Invalid rules');
   }
   if (Buffer.byteLength(JSON.stringify(rules)) > 1024) throw new Error('Invalid rules');
@@ -53,13 +58,22 @@ type Command =
   | { type: 'ready'; ready: boolean }
   | ({ type: 'update_room' } & RoomSettings)
   | { type: 'kick_player'; playerId: string; ban?: boolean }
-  | { type: 'unban_player' | 'transfer_host' | 'invite_player' | 'party_invite' | 'friend_request' | 'friend_remove' | 'block_player' | 'unblock_player'; playerId: string }
-  | { type: 'party_accept'; invitationToken: string }
+  | { type: 'unban_player' | 'transfer_host' | 'invite_player' | 'party_invite' | 'friend_request' | 'friend_remove' | 'block_player' | 'unblock_player' | 'party_transfer_leader' | 'party_kick'; playerId: string }
+  | { type: 'party_accept' | 'decline_invitation' | 'revoke_invitation'; invitationToken: string }
+  | { type: 'list_invitations'; direction?: 'incoming' | 'outgoing' }
+  | { type: 'list_match_results'; cursor?: string; limit?: number }
+  | { type: 'ack_match_result'; resultId: string }
+  | { type: 'party_join_room'; roomId: string; password?: string; invitationToken?: string }
+  | { type: 'match_accept' | 'match_decline'; proposalId: string }
+  | { type: 'chat_send'; scope: 'room' | 'party'; text: string }
+  | { type: 'chat_history'; scope: 'room' | 'party'; cursor?: string; limit?: number }
+  | { type: 'chat_mute'; scope: 'room' | 'party'; playerId: string; until: number }
+  | { type: 'chat_report'; messageId: string; reason: string }
   | { type: 'friend_respond'; playerId: string; accept: boolean }
   | ({ type: 'quick_join'; password?: string } & RoomFilters)
-  | ({ type: 'queue_join'; minPlayers?: number; maxPlayers?: number } & Compatibility)
+  | ({ type: 'queue_join'; minPlayers?: number; maxPlayers?: number; matching?: 'basic' | 'advanced'; rolePreferences?: string[] } & Compatibility)
   | { type: 'delete_room'; roomId?: string }
-  | { type: 'leave_room' | 'ping' | 'start_game' | 'sync_state' | 'queue_leave' | 'party_create' | 'party_leave' | 'list_friends' | 'list_games' | 'list_owned_rooms' | 'list_blocks' };
+  | { type: 'leave_room' | 'ping' | 'start_game' | 'sync_state' | 'queue_leave' | 'party_create' | 'party_leave' | 'party_disband' | 'list_friends' | 'list_games' | 'list_owned_rooms' | 'list_blocks' };
 export type ClientMessage = Command & { requestId?: string };
 
 const compatibility = ['version', 'mode', 'region'];
@@ -69,10 +83,14 @@ export const CLIENT_FIELDS: Record<ClientMessage['type'], readonly string[]> = {
   auth: ['token', 'protocolVersion'], refresh_auth: ['token'], select_game: ['gameId', ...compatibility], switch_game: ['gameId', ...compatibility],
   list_rooms: ['page', 'pageSize', 'cursor', ...filters], create_room: [...settings, ...compatibility], join_room: ['roomId', 'password', 'role', 'invitationToken'],
   ready: ['ready'], start_game: [], update_room: settings, kick_player: ['playerId', 'ban'], unban_player: ['playerId'], transfer_host: ['playerId'],
-  invite_player: ['playerId'], quick_join: [...filters, 'password'], queue_join: ['minPlayers', 'maxPlayers', ...compatibility], queue_leave: [],
+  invite_player: ['playerId'], quick_join: [...filters, 'password'], queue_join: ['minPlayers', 'maxPlayers', 'matching', 'rolePreferences', ...compatibility], queue_leave: [],
   party_create: [], party_invite: ['playerId'], party_accept: ['invitationToken'], party_leave: [], friend_request: ['playerId'],
   friend_respond: ['playerId', 'accept'], friend_remove: ['playerId'], list_friends: [], list_games: [], sync_state: [], leave_room: [], delete_room: ['roomId'], ping: [],
   list_owned_rooms: [], block_player: ['playerId'], unblock_player: ['playerId'], list_blocks: [],
+  list_invitations: ['direction'], decline_invitation: ['invitationToken'], revoke_invitation: ['invitationToken'],
+  list_match_results: ['cursor','limit'], ack_match_result: ['resultId'], party_transfer_leader: ['playerId'], party_kick: ['playerId'], party_disband: [],
+  party_join_room: ['roomId','password','invitationToken'], match_accept: ['proposalId'], match_decline: ['proposalId'],
+  chat_send: ['scope','text'], chat_history: ['scope','cursor','limit'], chat_mute: ['scope','playerId','until'], chat_report: ['messageId','reason'],
 };
 const fields = CLIENT_FIELDS;
 function text(value: unknown, max: number, min = 1): value is string {
@@ -110,15 +128,25 @@ export function parseClient(input: string, maxPageSize: number): ClientMessage {
   if (data.pageSize !== undefined && !positive(data.pageSize, maxPageSize)) bad();
   if (data.cursor !== undefined && data.page !== undefined) bad();
   if (data.minPlayers !== undefined && data.maxPlayers !== undefined && Number(data.minPlayers) > Number(data.maxPlayers)) bad();
+  if (data.limit !== undefined && !positive(data.limit, maxPageSize)) bad();
+  if (data.direction !== undefined && !['incoming','outgoing'].includes(String(data.direction))) bad();
+  if (data.matching !== undefined && !['basic','advanced'].includes(String(data.matching))) bad();
+  if (data.rolePreferences !== undefined && (!Array.isArray(data.rolePreferences) || data.rolePreferences.length > 32 || !data.rolePreferences.every(value => identifier(value)))) bad();
+  if (type.startsWith('chat_') && type !== 'chat_report' && !['room','party'].includes(String(data.scope))) bad();
+  if (type === 'chat_send' && !text(data.text, 2000)) bad();
+  if (type === 'chat_report' && (!identifier(data.messageId) || !text(data.reason, 512))) bad();
+  if (type === 'chat_mute' && (!text(data.playerId, 128) || !positive(data.until, Number.MAX_SAFE_INTEGER, 0))) bad();
+  if (type === 'ack_match_result' && !identifier(data.resultId)) bad();
+  if ((type === 'match_accept' || type === 'match_decline') && !identifier(data.proposalId)) bad();
   switch (type) {
     case 'auth': case 'refresh_auth': if (!text(data.token, 3500)) bad(); break;
     case 'select_game': case 'switch_game': if (!identifier(data.gameId)) bad(); break;
     case 'create_room': if (!text(data.name, 32)) bad(); break;
-    case 'join_room': if (!identifier(data.roomId)) bad(); break;
+    case 'join_room': case 'party_join_room': if (!identifier(data.roomId)) bad(); break;
     case 'ready': if (typeof data.ready !== 'boolean') bad(); break;
     case 'friend_respond': if (typeof data.accept !== 'boolean' || !text(data.playerId, 128) || Buffer.byteLength(data.playerId as string) > 128) bad(); break;
-    case 'party_accept': if (!identifier(data.invitationToken)) bad(); break;
-    case 'kick_player': case 'unban_player': case 'transfer_host': case 'invite_player': case 'party_invite': case 'friend_request': case 'friend_remove': case 'block_player': case 'unblock_player':
+    case 'party_accept': case 'decline_invitation': case 'revoke_invitation': if (!identifier(data.invitationToken)) bad(); break;
+    case 'party_transfer_leader': case 'party_kick': case 'kick_player': case 'unban_player': case 'transfer_host': case 'invite_player': case 'party_invite': case 'friend_request': case 'friend_remove': case 'block_player': case 'unblock_player':
       if (!text(data.playerId, 128) || Buffer.byteLength(data.playerId as string) > 128) bad(); break;
     case 'delete_room': if (data.roomId !== undefined && !identifier(data.roomId)) bad(); break;
     case 'update_room': if (Object.keys(data).every(key => key === 'type' || key === 'requestId')) bad(); break;

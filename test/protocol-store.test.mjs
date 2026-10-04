@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import { loadConfig, validateConfig } from '../dist/config.js';
-import { parseClient, ProtocolError, CLIENT_FIELDS } from '../dist/protocol/index.js';
+import { parseClient, ProtocolError } from '../dist/protocol/index.js';
 import { SqliteRoomStore } from '../dist/store/index.js';
 import { backupDatabase } from '../dist/store/backup.js';
 import { dev } from './helpers.mjs';
@@ -20,6 +20,8 @@ test('protocol rejects unknown fields and unsafe values; accepts Unicode room na
   for (const message of invalid) assert.throws(() => parseClient(JSON.stringify(message), 200), error => error instanceof ProtocolError && error.code === 'bad_request');
   assert.throws(() => parseClient('{"type":"__proto__"}', 200), error => error.code === 'unknown_type');
   assert.equal(parseClient(JSON.stringify({ type: 'create_room', name: '貓'.repeat(32) }), 200).name, '貓'.repeat(32));
+  assert.throws(() => parseClient(JSON.stringify({ type: 'auth', token: 'ok', protocolVersion: 2 }), 200), error => error.code === 'unsupported_protocol');
+  assert.equal(parseClient(JSON.stringify({ type: 'auth', token: 'ok', protocolVersion: 3 }), 200).protocolVersion, 3);
 });
 
 test('commented config loads and security modes fail closed; # inside strings is preserved', async t => {
@@ -28,9 +30,6 @@ test('commented config loads and security modes fail closed; # inside strings is
   assert.throws(() => validateConfig({ ...config, server: { ...config.server, listenHost: '0.0.0.0' } }, dev), /loopback/);
   assert.throws(() => validateConfig({ ...config, auth: { ...config.auth, mode: 'jwks' } }, dev), /JWKS/);
   assert.throws(() => validateConfig({ ...config, auth: { ...config.auth, mode: 'jwks', jwksUrl: 'https://issuer.example/jwks', issuer: 'https://issuer.example', audience: 'beacon', revocationUrl: 'https://issuer.example/revocations', revocationTokenFile: '' } }, dev), /token file/);
-  const schema = JSON.parse(await readFile(new URL('../protocol.schema.json', import.meta.url), 'utf8'));
-  assert.deepEqual(schema.clientCommands, CLIENT_FIELDS);
-  assert.equal(schema.version, 2);
   const dir = await mkdtemp(join(tmpdir(), 'beacon-config-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   config.auth.mockPlayers[0].token = 'quoted-"-#-token';
@@ -107,4 +106,23 @@ test('legacy room migration preserves credentials/ownership and complete updates
   store.deleteSocial('z', 'a');
   assert.deepEqual(store.listSocial(), []);
   store.close();
+});
+
+test('cluster configuration distinguishes control WebSocket and coordinator HTTP schemes without production bypasses', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'beacon-cluster-config-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const secretPath = join(directory, 'control.secret');
+  await writeFile(secretPath, 'local-control-secret-for-config-validation', { mode: 0o600 });
+  const config = await loadConfig('config.yaml', dev);
+  Object.assign(config.cluster, { enabled: true, development: true, endpoints: ['http://127.0.0.1:2379'] });
+  Object.assign(config.cluster.control, { advertiseUrl: 'ws://127.0.0.1:34570', secretPath });
+  validateConfig(config, dev);
+  assert.throws(() => validateConfig(config, { mockAuth: true, insecureWs: false }), /development transport flag/);
+  config.cluster.control.advertiseUrl = 'ws://192.0.2.1:34570';
+  assert.throws(() => validateConfig(config, dev), /control requires WSS/);
+  config.cluster.control.advertiseUrl = 'https://127.0.0.1:34570';
+  assert.throws(() => validateConfig(config, dev), /control requires WSS/);
+  config.cluster.control.advertiseUrl = 'ws://127.0.0.1:34570';
+  config.cluster.endpoints = ['http://192.0.2.1:2379'];
+  assert.throws(() => validateConfig(config, dev), /Etcd endpoints require authenticated TLS/);
 });

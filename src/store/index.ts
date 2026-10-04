@@ -1,8 +1,10 @@
 import { DatabaseSync } from 'node:sqlite';
 import { chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { AuditEvent, Moderation, PlayerBlock, RoomStore, SocialLink, StoredInvitation, StoredParty, StoredRoom, ReconnectSeat } from '../types.js';
+import type { AuditEvent, Moderation, PlayerBlock, RoomStore, SocialLink, StoredInvitation, StoredParty, StoredRoom, ReconnectSeat, DurableDomain } from '../types.js';
 import { readRules } from '../protocol/index.js';
+import { domainId, domainKinds, emptyDomain, type DomainKind } from './domain.js';
+import { migrateDomain } from './migrate-domain.js';
 
 function text(value: unknown, max = 128, empty = false): value is string {
   return typeof value === 'string' && (empty || value.length > 0) && Buffer.byteLength(value) <= max && !/[\p{Cc}\p{Cs}]/u.test(value);
@@ -12,7 +14,7 @@ function roomValid(room: StoredRoom): void {
   if (!text(room.id) || !/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/.test(room.id) || !text(room.gameId) || !/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/.test(room.gameId) || !text(room.name, 128) || [...room.name].length > 32 || !text(room.ownerId) || !text(room.hostId) || !(room.passwordHash === null || text(room.passwordHash, 512)) || !integer(room.maxPlayers, 1) || !['open', 'starting', 'in_game', 'closed'].includes(room.state) || !['public', 'unlisted', 'invite'].includes(room.visibility) || typeof room.locked !== 'boolean' || ![room.version, room.mode, room.region].every(v => text(v, 64, true)) || !['closed', 'fill', 'spectate'].includes(room.joinPolicy) || !integer(room.maxSpectators) || !integer(room.revision, 1) || ![room.bannedIds, room.invitedIds].every(v => Array.isArray(v) && v.length <= 10000 && v.every(id => text(id)) && new Set(v).size === v.length) || !(room.matchId === null || text(room.matchId)) || !integer(room.createdAt) || !integer(room.updatedAt)) throw new Error('Invalid persisted room data');
   if (room.matchRequest !== undefined) {
     const request = room.matchRequest;
-    if (!request || typeof request !== 'object' || Object.keys(request).some(key => !['operationId', 'roomId', 'gameId', 'players', 'version', 'mode', 'region', 'rules'].includes(key)) || !text(request.operationId) || request.roomId !== room.id || request.gameId !== room.gameId || request.version !== room.version || request.mode !== room.mode || request.region !== room.region || !Array.isArray(request.players) || !request.players.length || !request.players.every(player => player && typeof player === 'object' && Object.keys(player).length === 2 && text(player.id) && (player.role === 'player' || player.role === 'spectator')) || new Set(request.players.map(player => player.id)).size !== request.players.length || Buffer.byteLength(JSON.stringify(request)) > 262144) throw new Error('Invalid persisted match request');
+    if (!request || typeof request !== 'object' || Object.keys(request).some(key => !['operationId', 'roomId', 'gameId', 'players', 'version', 'mode', 'region', 'rules', 'joinPolicy'].includes(key)) || !text(request.operationId) || request.roomId !== room.id || request.gameId !== room.gameId || request.version !== room.version || request.mode !== room.mode || request.region !== room.region || !Array.isArray(request.players) || !request.players.length || !request.players.every(player => player && typeof player === 'object' && Object.keys(player).every(key => ['id','role','team','gameRole'].includes(key)) && text(player.id) && (player.role === 'player' || player.role === 'spectator') && (player.team === undefined || integer(player.team)) && (player.gameRole === undefined || text(player.gameRole))) || new Set(request.players.map(player => player.id)).size !== request.players.length || Buffer.byteLength(JSON.stringify(request)) > 262144) throw new Error('Invalid persisted match request');
     if (request.rules !== undefined) { try { if (JSON.stringify(readRules(request.rules)) !== JSON.stringify(room.rules)) throw new Error('Invalid persisted match request'); } catch { throw new Error('Invalid persisted match request'); } }
   }
   if (room.rules !== undefined) { try { if (JSON.stringify(readRules(room.rules)) !== JSON.stringify(room.rules)) throw new Error('Invalid persisted room data'); } catch { throw new Error('Invalid persisted room data'); } }
@@ -21,12 +23,7 @@ function roomValid(room: StoredRoom): void {
 function seatsValid(seats: ReconnectSeat[], max: number): void {
   if (!Array.isArray(seats) || seats.length > max || new Set(seats.map(seat => seat.playerId)).size !== seats.length) throw new Error('Invalid persisted room data');
   for (const seat of seats) {
-    if (!seat || typeof seat !== 'object' || Object.keys(seat).some(key => !['playerId', 'role', 'ready', 'gameId', 'version', 'mode', 'region', 'displayName', 'expiresAt', 'pendingResult'].includes(key)) || !text(seat.playerId) || (seat.role !== 'player' && seat.role !== 'spectator') || typeof seat.ready !== 'boolean' || !text(seat.gameId) || ![seat.version, seat.mode, seat.region].every(value => text(value, 64, true)) || !text(seat.displayName) || !integer(seat.expiresAt)) throw new Error('Invalid persisted room data');
-    if (seat.pendingResult !== undefined) {
-      const pending = seat.pendingResult;
-      if (!pending || typeof pending !== 'object' || Object.keys(pending).some(key => key !== 'matchId' && key !== 'result') || !text(pending.matchId)) throw new Error('Invalid persisted room data');
-      try { if (JSON.stringify(readRules(pending.result)) !== JSON.stringify(pending.result)) throw new Error('Invalid persisted room data'); } catch { throw new Error('Invalid persisted room data'); }
-    }
+    if (!seat || typeof seat !== 'object' || Object.keys(seat).some(key => !['playerId', 'role', 'ready', 'gameId', 'version', 'mode', 'region', 'displayName', 'expiresAt'].includes(key)) || !text(seat.playerId) || (seat.role !== 'player' && seat.role !== 'spectator') || typeof seat.ready !== 'boolean' || !text(seat.gameId) || ![seat.version, seat.mode, seat.region].every(value => text(value, 64, true)) || !text(seat.displayName) || !integer(seat.expiresAt)) throw new Error('Invalid persisted room data');
   }
 }
 function moderationValid(value: Moderation): void {
@@ -38,9 +35,9 @@ function socialValid(value: SocialLink): void {
 function partyValid(value: StoredParty): void {
   if (!text(value.id) || !text(value.leaderId) || !Array.isArray(value.members) || value.members.length < 1 || value.members.length > 128 || !value.members.every(id => text(id)) || new Set(value.members).size !== value.members.length || !value.members.includes(value.leaderId)) throw new Error('Invalid party data');
 }
-function invitationValid(value: StoredInvitation): void {
+function invitationValid(value: Partial<StoredInvitation>): asserts value is StoredInvitation {
   const keys = Object.keys(value);
-  if (!text(value.token) || !text(value.target) || !integer(value.expiresAt, 1) || keys.some(key => !['token', 'target', 'expiresAt', 'roomId', 'partyId'].includes(key)) || (value.roomId === undefined) === (value.partyId === undefined) || (value.roomId !== undefined && !text(value.roomId)) || (value.partyId !== undefined && !text(value.partyId))) throw new Error('Invalid invitation data');
+  if (!text(value.token) || !text(value.target) || !text(value.sender) || !integer(value.createdAt) || !integer(value.expiresAt, 1) || keys.some(key => !['token', 'target', 'expiresAt', 'roomId', 'partyId', 'sender', 'status', 'createdAt', 'resolvedAt'].includes(key)) || (value.roomId === undefined) === (value.partyId === undefined) || (value.roomId !== undefined && !text(value.roomId)) || (value.partyId !== undefined && !text(value.partyId)) || !['pending','accepted','declined','revoked','expired'].includes(String(value.status)) || (value.resolvedAt !== undefined && !integer(value.resolvedAt))) throw new Error('Invalid invitation data');
 }
 function blockValid(value: PlayerBlock): void {
   if (!text(value.playerId) || !text(value.targetId) || value.playerId === value.targetId || Object.keys(value).some(key => key !== 'playerId' && key !== 'targetId')) throw new Error('Invalid block data');
@@ -49,11 +46,18 @@ function auditValid(value: AuditEvent): void {
   if (!integer(value.at) || !text(value.actor) || !text(value.action) || !text(value.target, 256, true)) throw new Error('Invalid audit data');
 }
 function metadata(room: StoredRoom): string {
-  const { ownerId, visibility, locked, version, mode, region, joinPolicy, maxSpectators, revision, bannedIds, invitedIds, matchId, matchRequest, rules, seats } = room;
-  return JSON.stringify({ ownerId, visibility, locked, version, mode, region, joinPolicy, maxSpectators, revision, bannedIds, invitedIds, matchId, ...(matchRequest === undefined ? {} : { matchRequest }), ...(rules === undefined ? {} : { rules }), ...(seats?.length ? { seats } : {}) });
+  const { ownerId, visibility, locked, version, mode, region, joinPolicy, maxSpectators, revision, bannedIds, invitedIds, matchId, matchRequest, rules, seats, assignments } = room;
+  return JSON.stringify({ ownerId, visibility, locked, version, mode, region, joinPolicy, maxSpectators, revision, bannedIds, invitedIds, matchId, ...(matchRequest === undefined ? {} : { matchRequest }), ...(assignments === undefined ? {} : { assignments }), ...(rules === undefined ? {} : { rules }), ...(seats?.length ? { seats } : {}) });
 }
 export class SqliteRoomStore implements RoomStore {
   private readonly db: DatabaseSync;
+  private changesetHook?: (changeset: Uint8Array) => void;
+  private durabilityFailureHook?: () => void;
+  private readonly domainRecords = new Map<string, { kind: DomainKind; id: string; value: object; data: string }>();
+  private domainArrays: Partial<Record<DomainKind, readonly object[]>> = {};
+  private readonly domainValues = new WeakMap<object, { kind: DomainKind; id: string; data: string }>();
+  private afterCommit: (() => void)[] = [];
+  private importing = false;
   constructor(path: string) {
     if (path === ':memory:') throw new Error('Room persistence requires a database file');
     const existed = existsSync(path);
@@ -71,7 +75,7 @@ export class SqliteRoomStore implements RoomStore {
       try {
         db.exec('CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL) STRICT');
         const versions = db.prepare('SELECT version FROM schema_migrations ORDER BY version').all();
-        if (versions.some(row => row.version !== 1 && row.version !== 2 && row.version !== 3) || (versions.length && versions[0]?.version !== 1)) throw new Error('Unsupported schema version');
+        if (versions.some(row => ![1,2,3,4,5].includes(Number(row.version))) || (versions.length && versions[0]?.version !== 1)) throw new Error('Unsupported schema version');
         if (!versions.length) {
           db.exec(`CREATE TABLE rooms (
             id TEXT PRIMARY KEY, game_id TEXT NOT NULL, name TEXT NOT NULL,
@@ -102,8 +106,17 @@ export class SqliteRoomStore implements RoomStore {
           CREATE TABLE blocks(player_id TEXT NOT NULL, target_id TEXT NOT NULL, PRIMARY KEY(player_id, target_id), CHECK(player_id != target_id)) STRICT;`);
           db.prepare('INSERT INTO schema_migrations VALUES(3, ?)').run(Date.now());
         }
+        if (!versions.some(row => row.version === 4)) {
+          db.exec(`ALTER TABLE invitations ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}';
+            CREATE TABLE domain_state(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL CHECK(json_valid(data))) STRICT;`);
+          db.prepare('INSERT INTO schema_migrations VALUES(4, ?)').run(Date.now());
+        }
+        if (!versions.some(row => row.version === 5)) {
+          migrateDomain(db);
+          db.prepare('INSERT INTO schema_migrations VALUES(5, ?)').run(Date.now());
+        }
         this.db = db;
-        this.load(); this.listModeration(); this.listSocial(); this.listParties(); this.listInvitations(); this.listBlocks(); this.listAudit(1000);
+        this.load(); this.listModeration(); this.listSocial(); this.listParties(); this.listInvitations(); this.listBlocks(); this.listAudit(1000); this.loadDomain();
         db.exec('COMMIT');
       } catch (error) { if (db.isTransaction) db.exec('ROLLBACK'); throw error; }
       for (const suffix of ['-wal', '-shm']) if (existsSync(path + suffix)) chmodSync(path + suffix, 0o600);
@@ -117,7 +130,7 @@ export class SqliteRoomStore implements RoomStore {
       if (typeof row.metadata !== 'string' || Buffer.byteLength(row.metadata) > 3000000) throw new Error('Invalid persisted room data');
       const data: unknown = JSON.parse(row.metadata);
       if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('Invalid persisted room data');
-      const allowed = ['ownerId', 'visibility', 'locked', 'version', 'mode', 'region', 'joinPolicy', 'maxSpectators', 'revision', 'bannedIds', 'invitedIds', 'matchId', 'matchRequest', 'rules', 'seats'];
+      const allowed = ['ownerId', 'visibility', 'locked', 'version', 'mode', 'region', 'joinPolicy', 'maxSpectators', 'revision', 'bannedIds', 'invitedIds', 'matchId', 'matchRequest', 'rules', 'seats', 'assignments'];
       if (Object.keys(data).some(key => !allowed.includes(key))) throw new Error('Invalid persisted room metadata');
       const room = { ...data, id: row.id, gameId: row.game_id, name: row.name, hostId: row.host_id, passwordHash: row.password_hash, maxPlayers: row.max_players, state: row.state, createdAt: row.created_at, updatedAt: row.updated_at } as StoredRoom;
       roomValid(room);
@@ -125,9 +138,112 @@ export class SqliteRoomStore implements RoomStore {
     });
   }
   private commit(write: () => void): void {
+    if (this.db.isTransaction) { write(); return; }
+    const session = !this.importing && this.changesetHook ? this.db.createSession() : undefined;
+    let replicated = false;
+    this.afterCommit = [];
     this.db.exec('BEGIN IMMEDIATE');
-    try { write(); this.db.exec('COMMIT'); }
-    catch (error) { if (this.db.isTransaction) this.db.exec('ROLLBACK'); throw error; }
+    try {
+      write();
+      if (session) {
+        const bytes = session.changeset();
+        if (bytes.length) { this.changesetHook?.(bytes); replicated = true; }
+      }
+      this.db.exec('COMMIT');
+      for (const operation of this.afterCommit) operation();
+    } catch (error) {
+      if (replicated) this.durabilityFailureHook?.();
+      if (this.db.isTransaction) this.db.exec('ROLLBACK');
+      this.loadDomain();
+      throw error;
+    } finally { this.afterCommit = []; session?.close(); }
+  }
+  transaction(operation: () => void): void { this.commit(operation); }
+  setChangesetHook(hook: (changeset: Uint8Array) => void): void { this.changesetHook = hook; }
+  setDurabilityFailureHook(hook: () => void): void { this.durabilityFailureHook = hook; }
+  applyChangeset(changeset: Uint8Array): void {
+    this.importing = true;
+    try { this.commit(() => {
+      if (!this.db.applyChangeset(changeset)) throw new Error('Changeset conflict');
+      this.afterCommit.push(() => { this.domainRecords.clear(); this.domainArrays = {}; });
+    }); }
+    finally { this.importing = false; }
+  }
+  loadDomain(): DurableDomain {
+    const domain = emptyDomain();
+    this.domainRecords.clear();
+    for (const row of this.db.prepare('SELECT kind,id,data FROM domain_records ORDER BY rowid').all()) {
+      if (!domainKinds.includes(row.kind as DomainKind) || typeof row.data !== 'string') throw new Error('Invalid durable domain');
+      const kind = row.kind as DomainKind;
+      const value: unknown = JSON.parse(row.data);
+      const id = domainId(kind, value);
+      if (id !== row.id) throw new Error('Invalid durable identity');
+      (domain[kind] as object[]).push(value as object);
+      this.domainRecords.set(JSON.stringify([kind, id]), { kind, id, value: value as object, data: row.data });
+      this.domainValues.set(value as object, { kind, id, data: row.data });
+    }
+    this.domainArrays = Object.fromEntries(domainKinds.map(kind => [kind, domain[kind]]));
+    return domain;
+  }
+  saveDomain(domain: DurableDomain): void {
+    this.commit(() => {
+      const changes: { key: string; kind: DomainKind; id: string; value: object; data: string }[] = [];
+      const removed: string[] = [];
+      const arrays: Partial<Record<DomainKind, readonly object[]>> = {};
+      for (const kind of domainKinds) {
+        const values: readonly object[] = domain[kind] ?? [];
+        if (values === this.domainArrays[kind]) continue;
+        arrays[kind] = values;
+        const seen = new Set<string>();
+        for (const value of values) {
+          const cached = this.domainValues.get(value);
+          const id = cached?.kind === kind ? cached.id : domainId(kind, value);
+          const key = JSON.stringify([kind, id]);
+          if (seen.has(key)) throw new Error('Duplicate durable identity');
+          seen.add(key);
+          const previous = this.domainRecords.get(key);
+          if (previous?.value === value) continue;
+          const data = cached?.kind === kind ? cached.data : JSON.stringify(value);
+          if (previous?.data !== data) this.db.prepare('INSERT INTO domain_records VALUES(?,?,?) ON CONFLICT(kind,id) DO UPDATE SET data=excluded.data').run(kind, id, data);
+          changes.push({ key, kind, id, value, data });
+        }
+        for (const [key, previous] of this.domainRecords) if (previous.kind === kind && !seen.has(key)) {
+          this.db.prepare('DELETE FROM domain_records WHERE kind=? AND id=?').run(kind, previous.id);
+          removed.push(key);
+        }
+      }
+      for (const key of removed) this.domainRecords.delete(key);
+      for (const change of changes) {
+        this.domainRecords.set(change.key, change);
+        this.domainValues.set(change.value, { kind: change.kind, id: change.id, data: change.data });
+      }
+      Object.assign(this.domainArrays, arrays);
+    });
+  }
+  exportSnapshot(): string {
+    const tables: Record<string, unknown[]> = {};
+    for (const table of ['rooms','moderation','social','audit_events','parties','invitations','blocks','domain_records']) tables[table] = this.db.prepare(`SELECT * FROM ${table}`).all();
+    return JSON.stringify({ version: 5, tables });
+  }
+  importSnapshot(snapshot: string): void {
+    const value: unknown = snapshot === '' ? { version: 5, tables: {} } : JSON.parse(snapshot);
+    if (!value || typeof value !== 'object' || (value as Record<string, unknown>).version !== 5) throw new Error('Invalid snapshot');
+    const tables = (value as { tables: Record<string, unknown> }).tables;
+    if (!tables || typeof tables !== 'object') throw new Error('Invalid snapshot');
+    this.importing = true;
+    try { this.commit(() => {
+      for (const table of ['rooms','moderation','social','audit_events','parties','invitations','blocks','domain_records']) {
+        this.db.exec(`DELETE FROM ${table}`);
+        const rows = tables[table] ?? [];
+        if (!Array.isArray(rows)) throw new Error('Invalid snapshot');
+        const columns = this.db.prepare(`PRAGMA table_info(${table})`).all().map(row => String(row.name));
+        for (const row of rows) {
+          if (!row || typeof row !== 'object' || Array.isArray(row) || Object.keys(row).some(key => !columns.includes(key))) throw new Error('Invalid snapshot');
+          this.db.prepare(`INSERT INTO ${table} (${columns.join(',')}) VALUES (${columns.map(() => '?').join(',')})`).run(...columns.map(key => (row as Record<string, string | number | null>)[key] ?? null));
+        }
+      }
+      this.load(); this.listModeration(); this.listSocial(); this.listParties(); this.listInvitations(); this.listBlocks(); this.loadDomain();
+    }); } finally { this.importing = false; }
   }
   insert(room: StoredRoom): void {
     roomValid(room);
@@ -180,14 +296,17 @@ export class SqliteRoomStore implements RoomStore {
     this.commit(() => { this.db.prepare('DELETE FROM parties WHERE id=?').run(id); });
   }
   listInvitations(): StoredInvitation[] {
-    return this.db.prepare('SELECT token, target, expires_at AS expiresAt, room_id AS roomId, party_id AS partyId FROM invitations ORDER BY token').all().map(row => {
-      const invitation: StoredInvitation = { token: String(row.token), target: String(row.target), expiresAt: Number(row.expiresAt), ...(row.roomId ? { roomId: String(row.roomId) } : {}), ...(row.partyId ? { partyId: String(row.partyId) } : {}) };
+    return this.db.prepare('SELECT token, target, expires_at AS expiresAt, room_id AS roomId, party_id AS partyId, metadata FROM invitations ORDER BY token').all().map(row => {
+      const metadata: unknown = JSON.parse(String(row.metadata));
+      if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) throw new Error('Invalid invitation metadata');
+      const invitation = { ...metadata as Partial<StoredInvitation>, token: String(row.token), target: String(row.target), expiresAt: Number(row.expiresAt), ...(row.roomId ? { roomId: String(row.roomId) } : {}), ...(row.partyId ? { partyId: String(row.partyId) } : {}) };
       invitationValid(invitation); return invitation;
     });
   }
   saveInvitation(invitation: StoredInvitation): void {
     invitationValid(invitation);
-    this.commit(() => { this.db.prepare('INSERT INTO invitations VALUES(?,?,?,?,?) ON CONFLICT(token) DO UPDATE SET target=excluded.target, expires_at=excluded.expires_at, room_id=excluded.room_id, party_id=excluded.party_id').run(invitation.token, invitation.target, invitation.expiresAt, invitation.roomId ?? null, invitation.partyId ?? null); });
+    const { sender, status, createdAt, resolvedAt } = invitation;
+    this.commit(() => { this.db.prepare('INSERT INTO invitations VALUES(?,?,?,?,?,?) ON CONFLICT(token) DO UPDATE SET target=excluded.target, expires_at=excluded.expires_at, room_id=excluded.room_id, party_id=excluded.party_id, metadata=excluded.metadata').run(invitation.token, invitation.target, invitation.expiresAt, invitation.roomId ?? null, invitation.partyId ?? null, JSON.stringify({ sender, status, createdAt, resolvedAt })); });
   }
   deleteInvitation(token: string): void {
     if (!text(token)) throw new Error('Invalid invitation data');
@@ -206,7 +325,7 @@ export class SqliteRoomStore implements RoomStore {
   }
   audit(event: AuditEvent): void {
     auditValid(event);
-    this.commit(() => { this.db.prepare('INSERT INTO audit_events(at,actor,action,target) VALUES(?,?,?,?)').run(event.at, event.actor, event.action, event.target); });
+    this.commit(() => { this.db.prepare('INSERT INTO audit_events(at,actor,action,target) VALUES(?,?,?,?)').run(event.at, event.actor, event.action, event.target); this.db.exec('DELETE FROM audit_events WHERE id NOT IN (SELECT id FROM audit_events ORDER BY id DESC LIMIT 10000)'); });
   }
   listAudit(limit: number): AuditEvent[] {
     if (!integer(limit, 1) || limit > 1000) throw new Error('Invalid audit limit');

@@ -11,6 +11,8 @@ export async function environment(t, overrides = {}, dependencies = {}) {
   const config = await loadConfig('config.yaml', dev);
   config.server.listenPort = 0;
   config.db.path = join(dir, 'beacon.db');
+  config.cluster.enabled = false;
+  config.games.profileApiUrl = '';
   Object.assign(config.limits, { messageBurst: 1000, connectionBurst: 1000, maxConnectionsPerIp: 100 });
   config.lobby.reconnectGraceMs = 0;
   config.operations.drainTimeoutMs = 0;

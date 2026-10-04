@@ -53,7 +53,7 @@ test('token refresh preserves identity and seat, refuses an identity swap', asyn
   const room = state.messages.find(value => value.type === 'room_joined' || value.type === 'room_state');
   assert.equal(room.room?.id ?? room.roomId, id);
 });
-test('schema enforces v2 compatibility, correlation, queue bounds and strict room controls', () => {
+test('schema enforces protocol negotiation, correlation, queue bounds and strict room controls', () => {
   const invalid = [
     { type: 'auth', token: 'ok', protocolVersion: 1 },
     { type: 'create_room', name: 'x', requestId: '../unsafe' },

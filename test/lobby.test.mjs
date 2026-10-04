@@ -113,34 +113,18 @@ test('switch_game leaves current room and updates count for same-game lobby obse
 test('write failures return storage_error without changing creation, deletion, or host membership', async t => {
   let actual;
   let failing = false;
-  const wrapper = {
-    load() { return actual.load(); },
-    insert(room) { if (failing) throw new Error('disk failure'); actual.insert(room); },
-    setHost(...args) { if (failing) throw new Error('disk failure'); actual.setHost(...args); },
-    delete(id) { if (failing) throw new Error('disk failure'); actual.delete(id); },
-    update(room) { if (failing) throw new Error('disk failure'); actual.update(room); },
-    listModeration() { return actual.listModeration(); },
-    saveModeration(record) { actual.saveModeration(record); },
-    listSocial() { return actual.listSocial(); },
-    saveSocial(link) { actual.saveSocial(link); },
-    deleteSocial(...args) { actual.deleteSocial(...args); },
-    audit(event) { actual.audit(event); },
-    listAudit(limit) { return actual.listAudit(limit); },
-    listParties() { return actual.listParties(); },
-    saveParty(party) { actual.saveParty(party); },
-    deleteParty(id) { actual.deleteParty(id); },
-    listInvitations() { return actual.listInvitations(); },
-    saveInvitation(invitation) { actual.saveInvitation(invitation); },
-    deleteInvitation(token) { actual.deleteInvitation(token); },
-    listBlocks() { return actual.listBlocks(); },
-    saveBlock(block) { actual.saveBlock(block); },
-    deleteBlock(playerId, targetId) { actual.deleteBlock(playerId, targetId); },
-    close() { actual.close(); },
-  };
-  // The injected store is created lazily at load so environment owns its temporary directory.
-  const originalLoad = wrapper.load;
-  wrapper.load = function () { if (!actual) actual = new SqliteRoomStore(path); return originalLoad(); };
   let path;
+  const wrapper = new Proxy({}, {
+    get(_target, property) {
+      actual ??= new SqliteRoomStore(path);
+      const value = actual[property];
+      if (typeof value !== 'function') return value;
+      return (...args) => {
+        if (failing && ['insert', 'setHost', 'delete', 'update'].includes(property)) throw new Error('disk failure');
+        return value.apply(actual, args);
+      };
+    },
+  });
   // Use a separate temporary path supplied by an isolated configuration-free store.
   const { mkdtemp, rm } = await import('node:fs/promises');
   const { tmpdir } = await import('node:os');
