@@ -38,6 +38,19 @@ export interface Session {
   role?: 'player' | 'spectator';
   compatibility?: { version: string; mode: string; region: string };
 }
+export type Rules = Record<string, string | number | boolean>;
+export interface ReconnectSeat {
+  playerId: string;
+  role: 'player' | 'spectator';
+  ready: boolean;
+  gameId: string;
+  version: string;
+  mode: string;
+  region: string;
+  displayName: string;
+  expiresAt: number;
+  pendingResult?: { matchId: string; result: Rules };
+}
 export interface StoredRoom {
   id: string;
   gameId: string;
@@ -59,11 +72,16 @@ export interface StoredRoom {
   invitedIds: string[];
   matchId: string | null;
   matchRequest?: MatchRequest;
+  rules?: Rules;
+  seats?: ReconnectSeat[];
   createdAt: number;
   updatedAt: number;
 }
 export interface Moderation { playerId: string; bannedUntil: number; revokedBefore: number; reason: string }
 export interface SocialLink { a: string; b: string; status: 'pending' | 'accepted'; requestedBy: string }
+export interface StoredParty { id: string; leaderId: string; members: string[] }
+export interface StoredInvitation { token: string; target: string; expiresAt: number; roomId?: string; partyId?: string }
+export interface PlayerBlock { playerId: string; targetId: string }
 export interface AuditEvent { at: number; actor: string; action: string; target: string }
 export interface RoomStore {
   load(): StoredRoom[];
@@ -76,6 +94,15 @@ export interface RoomStore {
   listSocial(): SocialLink[];
   saveSocial(link: SocialLink): void;
   deleteSocial(a: string, b: string): void;
+  listParties(): StoredParty[];
+  saveParty(party: StoredParty): void;
+  deleteParty(id: string): void;
+  listInvitations(): StoredInvitation[];
+  saveInvitation(invitation: StoredInvitation): void;
+  deleteInvitation(token: string): void;
+  listBlocks(): PlayerBlock[];
+  saveBlock(block: PlayerBlock): void;
+  deleteBlock(playerId: string, targetId: string): void;
   audit(event: AuditEvent): void;
   listAudit(limit: number): AuditEvent[];
   close(): void;
@@ -88,6 +115,7 @@ export interface MatchRequest {
   version: string;
   mode: string;
   region: string;
+  rules?: Rules;
 }
 export interface Admission { serverUrl: string; ticket: string; expiresAt: number }
 export interface MatchAllocation { matchId: string; serverUrl: string; expiresAt: number; tickets: Record<string, string> }

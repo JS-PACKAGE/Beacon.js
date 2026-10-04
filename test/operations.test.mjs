@@ -7,6 +7,7 @@ import { createServer } from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
 import { loadConfig } from '../dist/config.js';
 import { startOperations, sendAlert } from '../dist/ops/index.js';
+import { ProtocolError } from '../dist/protocol/index.js';
 import { scheduledBackup } from '../dist/ops/backups.js';
 import { restoreDrill } from '../dist/ops/restore.js';
 import { configureLogging, closeLogging, log } from '../dist/log/index.js';
@@ -28,6 +29,8 @@ async function setup(t) {
     closeRoom: async (...args) => { calls.push(['close', ...args]); },
     maintenance: (...args) => { calls.push(['maintenance', ...args]); },
     audit: limit => [{ at: 1, actor: 'operator', action: 'ban', target: 'alice', limit }],
+    reportMatch: async (...args) => { calls.push(['match', ...args]); },
+    reportPlayerResult: async (...args) => { calls.push(['player-result', ...args]); },
   };
   return { directory, config, calls, hooks };
 }
@@ -42,7 +45,7 @@ test('internal operations rejects unauthorized and invalid requests and hides ho
   t.after(() => service.close());
   const base = `http://127.0.0.1:${service.address().port}`;
   const request = (path, input, authorization = `Bearer ${token}`) => fetch(base + path, { headers: { authorization, 'content-type': 'application/json' }, ...(input === undefined ? {} : { method: 'POST', body: JSON.stringify(input) }) });
-  for (const path of ['/health', '/ready', '/metrics', '/audit', '/ban', '/unban', '/revoke', '/rooms/close', '/maintenance']) {
+  for (const path of ['/health', '/ready', '/metrics', '/audit', '/ban', '/unban', '/revoke', '/rooms/close', '/matches/result', '/matches/player-result', '/maintenance']) {
     assert.equal((await request(path, path === '/ban' ? {} : undefined, 'Bearer wrong')).status, 403);
   }
   assert.equal((await request('/health')).status, 200);
@@ -61,7 +64,11 @@ test('internal operations rejects unauthorized and invalid requests and hides ho
     ['/ban', { playerId: 'alice', until: 123, reason: 'abuse' }],
     ['/unban', { playerId: 'alice' }], ['/revoke', { playerId: 'alice', before: 100 }],
     ['/rooms/close', { roomId: 'room-1' }], ['/maintenance', { enabled: true }],
+    ['/matches/result', { matchId: 'match-1', state: 'ended' }],
+    ['/matches/player-result', { matchId: 'match-1', playerId: 'alice', result: { score: 1 } }],
   ]) assert.equal((await request(path, body)).status, 200);
+  hooks.reportMatch = async () => { throw new ProtocolError('room_not_found'); };
+  assert.equal((await request('/matches/result', { matchId: 'missing', state: 'failed' })).status, 404);
   hooks.ready = () => false;
   assert.equal((await request('/ready')).status, 503);
   hooks.unban = async () => { throw new Error(`secret ${token}`); };
@@ -108,7 +115,7 @@ test('scheduled backups use SQLite snapshots, retain only own private files and 
   assert.equal((await lstat(last)).mode & 0o777, 0o600);
   const before = await readFile(last);
   const result = await restoreDrill(last);
-  assert.equal(result.integrity, 'ok'); assert.equal(result.rooms, 1); assert.ok(result.migrationVersions.length);
+  assert.equal(result.integrity, 'ok'); assert.equal(result.rooms, 1); assert.deepEqual(result.migrationVersions, [1, 2, 3]);
   assert.deepEqual(await readFile(last), before);
   assert.deepEqual(store.load(), [room]);
 });
@@ -124,7 +131,7 @@ test('restore drill executes real legacy migrations and preserves corrupt input'
   db.close();
   const before = await readFile(legacy);
   const result = await restoreDrill(legacy);
-  assert.equal(result.rooms, 1);
+  assert.equal(result.rooms, 1); assert.deepEqual(result.migrationVersions, [1, 2, 3]);
   assert.deepEqual(await readFile(legacy), before);
   const bad = join(directory, 'bad.sqlite'); await writeFile(bad, 'invalid sqlite');
   await assert.rejects(restoreDrill(bad)); assert.equal(await readFile(bad, 'utf8'), 'invalid sqlite');

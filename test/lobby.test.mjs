@@ -126,6 +126,15 @@ test('write failures return storage_error without changing creation, deletion, o
     deleteSocial(...args) { actual.deleteSocial(...args); },
     audit(event) { actual.audit(event); },
     listAudit(limit) { return actual.listAudit(limit); },
+    listParties() { return actual.listParties(); },
+    saveParty(party) { actual.saveParty(party); },
+    deleteParty(id) { actual.deleteParty(id); },
+    listInvitations() { return actual.listInvitations(); },
+    saveInvitation(invitation) { actual.saveInvitation(invitation); },
+    deleteInvitation(token) { actual.deleteInvitation(token); },
+    listBlocks() { return actual.listBlocks(); },
+    saveBlock(block) { actual.saveBlock(block); },
+    deleteBlock(playerId, targetId) { actual.deleteBlock(playerId, targetId); },
     close() { actual.close(); },
   };
   // The injected store is created lazily at load so environment owns its temporary directory.

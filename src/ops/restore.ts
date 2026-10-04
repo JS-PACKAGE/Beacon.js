@@ -24,7 +24,7 @@ export async function restoreDrill(source: string): Promise<RestoreDrillResult> 
     const rooms = store.load();
     if (JSON.stringify(rooms.map(room => room.id).sort()) !== JSON.stringify(expectedIds)) throw new Error('Room restore verification failed');
     // Loading exercises the current persisted room validator after the real migrations.
-    store.listModeration(); store.listSocial(); store.listAudit(200);
+    store.listModeration(); store.listSocial(); store.listParties(); store.listInvitations(); store.listBlocks(); store.listAudit(200);
     store.close(); store = undefined;
     database = new DatabaseSync(destination, { readOnly: true, allowExtension: false });
     const integrity = database.prepare('PRAGMA integrity_check').all();

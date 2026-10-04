@@ -123,12 +123,12 @@ test('in-game reconnect obtains a fresh admission and persistent match status is
   const alice = await f.connect('alice'); const room = await create(alice, { joinPolicy: 'fill' }); await alice.command({ type: 'ready', ready: true }); await alice.command({ type: 'start_game' });
   await f.restart(); await f.manager.maintain(); await f.flush();
   assert.equal(f.store.load()[0].state, 'in_game'); assert.equal(f.calls.status.length, 1);
-  const owner = await f.connect('alice'); await owner.command({ type: 'join_room', roomId: room.id });
+  const owner = await f.connect('alice', {}, false);
   const latest = await f.connect('alice', {}, false);
   const messages = await latest.command({ type: 'sync_state' });
   assert.equal(messages.find(message => message.type === 'session_state').room.id, room.id);
   assert.equal(messages.find(message => message.type === 'game_admission').ticket, 'admission-alice');
-  assert.equal(f.calls.admit.length, 2);
+  assert.equal(f.calls.admit.length, 1);
   assert.equal(owner.closed, true);
 });
 
@@ -144,9 +144,9 @@ test('target-bound invitations bypass password only for recipient, expire on pol
   await alice.command({ type: 'update_room', locked: false });
   await assert.rejects(bob.command({ type: 'join_room', roomId: room.id, invitationToken: next.invitationToken }), code('invitation_expired'));
   assert.equal((await carol.command({ type: 'list_rooms' }))[0].total, 0);
-  await f.restart(); const owner = await f.connect('alice');
-  const restored = await owner.command({ type: 'join_room', roomId: room.id });
-  assert.equal(restored.find(message => message.type === 'room_joined').members[0].isHost, true);
+  await f.restart(); const owner = await f.connect('alice', {}, false);
+  const restored = await owner.command({ type: 'sync_state' });
+  assert.equal(restored.find(message => message.type === 'session_state').members[0].isHost, true);
 });
 
 test('password guessing limit follows player across active replacement and failed writes do not expose phantom changes', async t => {
@@ -267,4 +267,22 @@ test('expired invitation is unusable even for its intended recipient', async t =
   const invitation = (await alice.command({ type: 'invite_player', playerId: 'bob' })).find(message => message.type === 'room_invitation');
   await f.manager.maintain(invitation.expiresAt + 1);
   await assert.rejects(bob.command({ type: 'join_room', roomId: room.id, invitationToken: invitation.invitationToken }), code('invitation_expired'));
+});
+
+test('room rules reach the match request and a player result stays private', async t => {
+  const f = await fixture(t);
+  const alice = await f.connect('alice'); const bob = await f.connect('bob');
+  const room = await create(alice, { rules: { map: 'harbor', ranked: false } });
+  assert.equal(room.rules.map, 'harbor');
+  await bob.command({ type: 'join_room', roomId: room.id });
+  await alice.command({ type: 'ready', ready: true }); await bob.command({ type: 'ready', ready: true });
+  await alice.command({ type: 'start_game' });
+  assert.deepEqual(f.calls.create[0].rules, { map: 'harbor', ranked: false });
+  const matchId = f.store.load()[0].matchId;
+  await f.manager.reportPlayerResult(matchId, 'alice', { score: 3 });
+  assert.equal(alice.messages.find(message => message.type === 'match_result').result.score, 3);
+  assert.equal(bob.messages.some(message => message.type === 'match_result'), false);
+  await f.manager.reportMatch(matchId, 'ended');
+  assert.equal(f.store.load()[0].state, 'open');
+  await f.manager.reportMatch(matchId, 'ended');
 });

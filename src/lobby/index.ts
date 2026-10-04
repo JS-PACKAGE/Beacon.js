@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { Config } from '../config.js';
 import type { ClientMessage } from '../protocol/index.js';
 import { ProtocolError, errorMessage } from '../protocol/index.js';
-import type { Admission, MatchAllocation, MatchRequest, Game, GameProvider, GameSessionProvider, Peer, Player, RoomStore, Session, StoredRoom, Moderation, SocialLink } from '../types.js';
+import type { Admission, MatchAllocation, MatchRequest, Game, GameProvider, GameSessionProvider, Peer, Player, RoomStore, Session, StoredRoom, Moderation, SocialLink, Rules, ReconnectSeat } from '../types.js';
 import { HttpGameSessions } from '../games/sessions.js';
 import { hashPassword, verifyPassword } from '../security/password.js';
 import { log } from '../log/index.js';
@@ -10,13 +10,26 @@ import { log } from '../log/index.js';
 function reply(peer: Peer, message: Record<string, unknown>): void { (peer.reply ?? peer.send).call(peer, message); }
 type Compatibility = { version: string; mode: string; region: string };
 type Filters = { query?: string; availableOnly?: boolean; sort?: 'created' | 'name' | 'players'; version?: string; mode?: string; region?: string };
+interface HeldSeat {
+  playerId: string;
+  displayName: string;
+  role: 'player' | 'spectator';
+  ready: boolean;
+  gameId: string;
+  compatibility: Compatibility;
+  expiresAt: number;
+  pendingResult?: { matchId: string; result: Rules };
+}
 interface Room extends StoredRoom {
   players: Map<string, Session>;
   reservations: Map<Session, 'player' | 'spectator'>;
+  held: Map<string, HeldSeat>;
+  pendingResults: Map<string, { matchId: string; result: Rules }>;
   emptySince: number | null;
   operation?: string;
   /** Serialized listing-visible fields at the last lobby broadcast; lets publish() skip no-op pushes. */
   lobbyKey?: string;
+  recentMatchId?: string;
 }
 interface Invitation { target: string; expiresAt: number; roomId?: string; partyId?: string }
 interface Party { id: string; leaderId: string; members: Set<string> }
@@ -34,6 +47,7 @@ export class RoomManager {
   private readonly parties = new Map<string, Party>();
   private readonly partyOf = new Map<string, string>();
   private readonly waiting: QueueEntry[] = [];
+  private readonly finishedMatches = new Map<string, number>();
   private readonly snapshots = new Map<string, Snapshot>();
   private readonly cursors = new Map<string, { snapshotId: string; page: number }>();
   private readonly recovering = new Set<string>();
@@ -47,9 +61,12 @@ export class RoomManager {
 
   constructor(private readonly config: Config, private readonly store: RoomStore, private readonly games: GameProvider, sessions?: GameSessionProvider) {
     this.provider = sessions ?? new HttpGameSessions(config.games);
-    for (const room of store.load()) this.rooms.set(room.id, { ...room, players: new Map(), reservations: new Map(), emptySince: Date.now() });
+    for (const room of store.load()) this.rooms.set(room.id, { ...room, players: new Map(), reservations: new Map(), held: new Map(), pendingResults: new Map(), emptySince: Date.now() });
     for (const record of store.listModeration()) this.moderation.set(record.playerId, record);
     for (const link of store.listSocial()) this.social.set(this.socialKey(link.a, link.b), link);
+    for (const party of store.listParties()) { this.parties.set(party.id, { id: party.id, leaderId: party.leaderId, members: new Set(party.members) }); for (const id of party.members) this.partyOf.set(id, party.id); }
+    for (const invitation of store.listInvitations()) if (invitation.expiresAt > Date.now()) this.invitations.set(invitation.token, invitation); else { try { store.deleteInvitation(invitation.token); } catch { log('error', 'invitation_cleanup_failed'); } }
+    this.restoreSeats();
   }
 
   connect(peer: Peer): void { this.sessions.set(peer.id, { peer, active: true, ready: false, role: 'player', compatibility: { version: '', mode: '', region: '' } }); }
@@ -89,7 +106,7 @@ export class RoomManager {
           session.ready = previous.ready ?? false; session.role = previous.role ?? 'player';
           if (previous.roomId) {
             const room = this.rooms.get(previous.roomId);
-            if (room) { this.commit(room); room.players.set(player.id, session); session.roomId = room.id; }
+            if (room) { room.players.set(player.id, session); session.roomId = room.id; this.commit(room); }
           }
           delete previous.roomId;
           previous.active = false;
@@ -100,6 +117,18 @@ export class RoomManager {
       }
       session.player = player;
       this.players.set(player.id, session);
+      if (!session.roomId) {
+        const heldRoom = [...this.rooms.values()].find(item => item.held.has(player.id));
+        const held = heldRoom?.held.get(player.id);
+        if (heldRoom && held && held.expiresAt > Date.now()) {
+          if (held.gameId) session.gameId = held.gameId;
+          session.compatibility = held.compatibility;
+          session.ready = held.ready; session.role = held.role;
+          heldRoom.held.delete(player.id); heldRoom.players.set(player.id, session); session.roomId = heldRoom.id; heldRoom.emptySince = null;
+          if (held.pendingResult) heldRoom.pendingResults.set(player.id, held.pendingResult);
+          this.commit(heldRoom);
+        }
+      }
       const room = session.roomId ? this.rooms.get(session.roomId) : undefined;
       if (room) this.publish(room, 'reconnect');
       this.presence(player.id);
@@ -141,21 +170,57 @@ export class RoomManager {
   private count(room: Room, role: 'player' | 'spectator' = 'player', reservations = false): number {
     let count = 0;
     for (const member of room.players.values()) if ((member.role ?? 'player') === role) count++;
+    for (const seat of room.held.values()) if (seat.role === role) count++;
     if (reservations) for (const pending of room.reservations.values()) if (pending === role) count++;
     return count;
   }
   private summary(room: Room): Record<string, unknown> {
-    return { id: room.id, gameId: room.gameId, name: room.name, ownerId: room.ownerId, hostId: room.hostId, playerCount: this.count(room), spectatorCount: this.count(room, 'spectator'), maxPlayers: room.maxPlayers, maxSpectators: room.maxSpectators, hasPassword: room.passwordHash !== null, state: room.state, visibility: room.visibility, locked: room.locked, version: room.version, mode: room.mode, region: room.region, joinPolicy: room.joinPolicy, revision: room.revision, createdAt: room.createdAt };
+    return { id: room.id, gameId: room.gameId, name: room.name, ownerId: room.ownerId, hostId: room.hostId, playerCount: this.count(room), spectatorCount: this.count(room, 'spectator'), maxPlayers: room.maxPlayers, maxSpectators: room.maxSpectators, hasPassword: room.passwordHash !== null, state: room.state, visibility: room.visibility, locked: room.locked, version: room.version, mode: room.mode, region: room.region, joinPolicy: room.joinPolicy, revision: room.revision, createdAt: room.createdAt, ...(room.rules && Object.keys(room.rules).length ? { rules: room.rules } : {}) };
   }
   private members(room: Room): Record<string, unknown>[] {
-    return [...room.players.values()].filter(member => member.player).map(member => ({ id: member.player!.id, displayName: member.player!.displayName, isHost: room.hostId === member.player!.id, ready: member.ready ?? false, role: member.role ?? 'player', connected: this.connected(member) }));
+    const live = [...room.players.values()].filter(member => member.player).map(member => ({ id: member.player!.id, displayName: member.player!.displayName, isHost: room.hostId === member.player!.id, ready: member.ready ?? false, role: member.role ?? 'player', connected: this.connected(member) }));
+    const held = [...room.held.values()].filter(seat => !room.players.has(seat.playerId)).map(seat => ({ id: seat.playerId, displayName: seat.displayName, isHost: room.hostId === seat.playerId, ready: seat.ready, role: seat.role, connected: false }));
+    return [...live, ...held];
+  }
+  private seatSnapshot(room: Room): ReconnectSeat[] {
+    const grace = this.config.lobby.reconnectGraceMs;
+    const now = Date.now();
+    const seats: ReconnectSeat[] = [];
+    for (const [playerId, session] of room.players) {
+      if (!session.player) continue;
+      const compatibility = session.compatibility ?? { version: room.version, mode: room.mode, region: room.region };
+      const pending = room.pendingResults.get(playerId);
+      seats.push({ playerId, role: session.role ?? 'player', ready: session.ready ?? false, gameId: session.gameId ?? room.gameId, version: compatibility.version, mode: compatibility.mode, region: compatibility.region, displayName: session.player.displayName, expiresAt: this.connected(session) ? 0 : (session.disconnectedAt ?? now) + grace, ...(pending ? { pendingResult: pending } : {}) });
+    }
+    for (const seat of room.held.values()) if (!room.players.has(seat.playerId)) seats.push({ playerId: seat.playerId, role: seat.role, ready: seat.ready, gameId: seat.gameId, version: seat.compatibility.version, mode: seat.compatibility.mode, region: seat.compatibility.region, displayName: seat.displayName, expiresAt: seat.expiresAt, ...(seat.pendingResult ? { pendingResult: seat.pendingResult } : {}) });
+    return seats;
+  }
+  private restoreSeats(): void {
+    const now = Date.now();
+    const grace = this.config.lobby.reconnectGraceMs;
+    for (const room of this.rooms.values()) {
+      const loaded = room.seats ?? [];
+      delete room.seats;
+      for (const seat of loaded) {
+        if (grace === 0) continue;
+        const expiresAt = seat.expiresAt === 0 ? now + grace : seat.expiresAt;
+        if (expiresAt <= now) continue;
+        room.held.set(seat.playerId, { playerId: seat.playerId, displayName: seat.displayName, role: seat.role, ready: seat.ready, gameId: seat.gameId, compatibility: { version: seat.version, mode: seat.mode, region: seat.region }, expiresAt, ...(seat.pendingResult ? { pendingResult: seat.pendingResult } : {}) });
+        if (seat.pendingResult) room.pendingResults.set(seat.playerId, seat.pendingResult);
+      }
+      room.emptySince = room.held.size ? null : now;
+      if (JSON.stringify(loaded) !== JSON.stringify(this.seatSnapshot(room))) { try { this.commit(room); } catch { log('error', 'seat_restore_failed'); } }
+    }
   }
   private commit(room: Room, patch: Partial<StoredRoom> = {}): void {
-    const next = { ...room, ...patch, revision: room.revision + 1, updatedAt: Date.now() };
+    const seats = this.seatSnapshot(room);
+    const next = { ...room, ...patch, revision: room.revision + 1, updatedAt: Date.now(), ...(seats.length ? { seats } : {}) };
+    if (!seats.length) delete next.seats;
     if (next.state !== 'starting') delete next.matchRequest;
     this.persist(() => this.store.update(next));
     Object.assign(room, patch, { revision: next.revision, updatedAt: next.updatedAt });
     if (!next.matchRequest) delete room.matchRequest;
+    if (seats.length) room.seats = seats; else delete room.seats;
     this.lobbyRevision++;
   }
   private recoverAdmissions(room: Room, matchId: string): void {
@@ -230,6 +295,12 @@ export class RoomManager {
     const room = session.roomId ? this.rooms.get(session.roomId) : undefined;
     this.sendMembers(session.peer, { type: 'session_state', ...(session.gameId ? { gameId: session.gameId } : {}), room: room ? this.summary(room) : null, ready: session.ready ?? false, role: session.role ?? 'player', revision: room?.revision ?? 0, lobbyRevision: this.lobbyRevision }, room ? this.members(room) : []);
     if (room) this.sendMembers(session.peer, { type: 'room_state', roomId: room.id, room: this.summary(room), playerCount: this.count(room), revision: room.revision, lobbyRevision: this.lobbyRevision, change: 'sync' }, this.members(room));
+    const pending = room && session.player ? room.pendingResults.get(session.player.id) : undefined;
+    if (room && pending && session.player) {
+      this.sendPacket(session.peer, { type: 'match_result', roomId: room.id, matchId: pending.matchId, result: pending.result }, false);
+      room.pendingResults.delete(session.player.id);
+      try { this.commit(room); } catch { room.pendingResults.set(session.player.id, pending); log('error', 'match_result_persist_failed'); }
+    }
     this.sendFriends(session); this.sendParty(session.player!.id, true);
     reply(session.peer, { type: 'queue_state', queued: this.waiting.some(entry => entry.members.includes(session.player!.id)) });
   }
@@ -282,15 +353,19 @@ export class RoomManager {
     if (!session.roomId || !session.player) return;
     const room = this.rooms.get(session.roomId);
     if (!room) { delete session.roomId; return; }
+    const playerId = session.player.id;
     const remaining = [...room.players.values()].filter(member => member !== session && member.role !== 'spectator');
     const nextHost = remaining.find(member => this.connected(member)) ?? remaining[0];
+    const heldHost = [...room.held.values()].find(seat => seat.role !== 'spectator');
     const starting = room.state === 'starting';
     const startingMatchId = starting ? room.matchId : null;
     const pendingRequest = starting && !room.operation && !room.matchId && !this.recovering.has(room.id) ? room.matchRequest : undefined;
-    this.commit(room, { ...patch, ...(room.hostId === session.player.id ? { hostId: nextHost?.player?.id ?? room.ownerId } : {}), ...(starting ? { state: 'open', matchId: null } : {}) });
-    room.players.delete(session.player.id); delete session.roomId; session.ready = false; session.role = 'player';
-    if (!room.players.size) room.emptySince = Date.now();
-    // A changing roster cancels an in-flight allocation; its late result is cancelled externally.
+    const previous = { roomId: session.roomId, ready: session.ready, role: session.role, emptySince: room.emptySince };
+    room.players.delete(playerId); room.pendingResults.delete(playerId); delete session.roomId; session.ready = false; session.role = 'player';
+    if (!room.players.size && !room.held.size && !room.reservations.size) room.emptySince = Date.now();
+    const hostId = room.hostId === playerId ? nextHost?.player?.id ?? heldHost?.playerId ?? room.ownerId : room.hostId;
+    try { this.commit(room, { ...patch, ...(hostId === room.hostId ? {} : { hostId }), ...(starting ? { state: 'open', matchId: null } : {}) }); }
+    catch (error) { room.players.set(playerId, session); session.roomId = previous.roomId; session.ready = previous.ready ?? false; session.role = previous.role ?? 'player'; room.emptySince = previous.emptySince; throw error; }
     if (starting) delete room.operation;
     if (startingMatchId) this.cancelMatch(startingMatchId);
     if (pendingRequest) this.cancelPending(pendingRequest);
@@ -318,7 +393,9 @@ export class RoomManager {
     }
     room.reservations.clear(); this.revokeInvites(room.id); this.broadcastLobby(room, 'remove');
   }
-  private revokeInvites(roomId: string): void { for (const [token, invitation] of this.invitations) if (invitation.roomId === roomId) this.invitations.delete(token); }
+  private revokeInvites(roomId: string): void {
+    for (const [token, invitation] of this.invitations) if (invitation.roomId === roomId) { try { this.persist(() => this.store.deleteInvitation(token)); } catch { log('error', 'invitation_cleanup_failed'); } this.invitations.delete(token); }
+  }
   private newRoom(session: Session & { player: Player }, game: Game, name: string, options: Partial<StoredRoom> = {}, announce = true): Room {
     this.available();
     if (session.roomId) throw new ProtocolError('already_in_room');
@@ -326,10 +403,11 @@ export class RoomManager {
     const compatibility = { ...this.compatibility(session), ...options };
     this.validateCompatibility(game, compatibility);
     const now = Date.now();
-    const room: Room = { id: randomUUID(), gameId: game.gameId, name, ownerId: session.player.id, hostId: session.player.id, passwordHash: null, maxPlayers: game.maxPlayersPerRoom, state: 'open', createdAt: now, updatedAt: now, visibility: 'public', locked: false, ...this.compatibility(session), joinPolicy: 'closed', maxSpectators: this.config.lobby.maxSpectators, revision: 1, bannedIds: [], invitedIds: [], matchId: null, ...options, players: new Map(), reservations: new Map(), emptySince: null };
+    const room: Room = { id: randomUUID(), gameId: game.gameId, name, ownerId: session.player.id, hostId: session.player.id, passwordHash: null, maxPlayers: game.maxPlayersPerRoom, state: 'open', createdAt: now, updatedAt: now, visibility: 'public', locked: false, ...this.compatibility(session), joinPolicy: 'closed', maxSpectators: this.config.lobby.maxSpectators, revision: 1, bannedIds: [], invitedIds: [], matchId: null, ...options, players: new Map([[session.player.id, session]]), reservations: new Map(), held: new Map(), pendingResults: new Map(), emptySince: null };
     if (room.maxPlayers > game.maxPlayersPerRoom || room.maxSpectators > this.config.lobby.maxSpectators) throw new ProtocolError('bad_request');
+    room.seats = this.seatSnapshot(room);
     this.persist(() => this.store.insert(room));
-    room.players.set(session.player.id, session); session.roomId = room.id; session.ready = false; session.role = 'player'; session.compatibility = { version: room.version, mode: room.mode, region: room.region };
+    session.roomId = room.id; session.ready = false; session.role = 'player'; session.compatibility = { version: room.version, mode: room.mode, region: room.region };
     this.rooms.set(room.id, room); this.lobbyRevision++;
     if (announce) { this.joined(session, room); this.broadcastLobby(room, 'add'); }
     return room;
@@ -382,9 +460,10 @@ export class RoomManager {
         if (session.roomId || JSON.stringify([room.passwordHash, room.locked, room.visibility, room.joinPolicy, room.state]) !== prepared.policy || room.matchId !== prepared.matchId || room.bannedIds.includes(session.player.id)) throw new ProtocolError('invalid_state');
         if (invitationToken) this.validInvitation(invitationToken, session.player.id, room);
         const hostId = role === 'player' && this.count(room) === 0 ? session.player.id : room.hostId;
-        this.commit(room, { hostId });
         room.reservations.delete(session); room.players.set(session.player.id, session); session.roomId = room.id; session.role = role; session.ready = false; room.emptySince = null;
-        if (invitationToken) this.invitations.delete(invitationToken);
+        try { this.commit(room, { hostId }); }
+        catch (error) { room.players.delete(session.player.id); delete session.roomId; room.reservations.set(session, role); throw error; }
+        if (invitationToken) { this.invitations.delete(invitationToken); try { this.persist(() => this.store.deleteInvitation(invitationToken)); } catch { log('error', 'invitation_cleanup_failed'); } }
         this.cancelQueue(session.player.id); this.joined(session, room); this.publish(room, 'join');
         if (admission) this.sendPacket(peer, { type: 'game_admission', roomId: room.id, matchId: room.matchId, ...admission });
       });
@@ -397,7 +476,7 @@ export class RoomManager {
       if (room.state !== 'open' || room.reservations.size) throw new ProtocolError('invalid_state');
       const members = [...room.players.values()];
       if (!members.some(member => member.role !== 'spectator') || members.some(member => member.role !== 'spectator' && (!member.ready || !this.connected(member)))) throw new ProtocolError('not_ready');
-      const request: MatchRequest = { operationId, roomId: room.id, gameId: room.gameId, players: members.map(member => ({ id: member.player!.id, role: member.role ?? 'player' })), version: room.version, mode: room.mode, region: room.region };
+      const request: MatchRequest = { operationId, roomId: room.id, gameId: room.gameId, players: members.map(member => ({ id: member.player!.id, role: member.role ?? 'player' })), version: room.version, mode: room.mode, region: room.region, ...(room.rules && Object.keys(room.rules).length ? { rules: room.rules } : {}) };
       this.commit(room, { state: 'starting', matchRequest: request }); room.operation = operationId; this.publish(room, 'starting');
       return { room, request, requesterId: session.player.id };
     });
@@ -445,7 +524,8 @@ export class RoomManager {
     if (message.type === 'select_game' || message.type === 'switch_game') {
       const game = await this.selectedGame(message.gameId);
       await this.serialized(() => {
-        this.requireSession(peer); if (message.type === 'select_game' && session.roomId) throw new ProtocolError('already_in_room');
+        this.requireSession(peer);
+        if (message.type === 'select_game' && session.roomId) { if (session.gameId === game.gameId) { this.sync(session); return; } throw new ProtocolError('already_in_room'); }
         const compatibility = { version: message.version ?? '', mode: message.mode ?? '', region: message.region ?? '' }; this.validateCompatibility(game, compatibility);
         this.leave(session); this.cancelQueue(session.player.id); session.gameId = game.gameId; session.compatibility = compatibility; this.snapshot(session, game); this.presence(session.player.id);
       }); return;
@@ -465,7 +545,7 @@ export class RoomManager {
       const game = await this.selectedGame(gameId); const passwordHash = message.password === undefined ? null : await hashPassword(message.password);
       await this.serialized(() => {
         this.requireSession(peer); this.cancelQueue(session.player.id);
-        this.newRoom(session, game, message.name, { passwordHash, ...(message.maxPlayers === undefined ? {} : { maxPlayers: message.maxPlayers }), ...(message.visibility === undefined ? {} : { visibility: message.visibility }), ...(message.locked === undefined ? {} : { locked: message.locked }), ...(message.version === undefined ? {} : { version: message.version }), ...(message.mode === undefined ? {} : { mode: message.mode }), ...(message.region === undefined ? {} : { region: message.region }), ...(message.joinPolicy === undefined ? {} : { joinPolicy: message.joinPolicy }), ...(message.maxSpectators === undefined ? {} : { maxSpectators: message.maxSpectators }) });
+        this.newRoom(session, game, message.name, { passwordHash, ...(message.maxPlayers === undefined ? {} : { maxPlayers: message.maxPlayers }), ...(message.visibility === undefined ? {} : { visibility: message.visibility }), ...(message.locked === undefined ? {} : { locked: message.locked }), ...(message.version === undefined ? {} : { version: message.version }), ...(message.mode === undefined ? {} : { mode: message.mode }), ...(message.region === undefined ? {} : { region: message.region }), ...(message.joinPolicy === undefined ? {} : { joinPolicy: message.joinPolicy }), ...(message.maxSpectators === undefined ? {} : { maxSpectators: message.maxSpectators }), ...(message.rules && Object.keys(message.rules).length ? { rules: message.rules } : {}) });
       }); return;
     }
     if (message.type === 'leave_room') { const game = await this.selectedGame(gameId); await this.serialized(() => { this.requireSession(peer); this.leave(session); this.snapshot(session, game); }); return; }
@@ -489,8 +569,14 @@ export class RoomManager {
         if (message.visibility !== undefined) patch.visibility = message.visibility;
         if (message.locked !== undefined) patch.locked = message.locked;
         if (message.joinPolicy !== undefined) patch.joinPolicy = message.joinPolicy;
+        if (message.rules !== undefined && Object.keys(message.rules).length) patch.rules = message.rules;
+        const previousRules = room.rules;
+        const clearRules = message.rules !== undefined && Object.keys(message.rules).length === 0;
+        if (clearRules) delete room.rules;
         const oldSummary = this.summary(room);
-        this.commit(room, { ...patch, invitedIds: [] }); this.revokeInvites(room.id);
+        try { this.commit(room, { ...patch, invitedIds: [] }); }
+        catch (error) { if (clearRules && previousRules) room.rules = previousRules; throw error; }
+        this.revokeInvites(room.id);
         if (wasPublic && room.visibility !== 'public') for (const observer of this.sessions.values()) if (this.connected(observer) && observer.gameId === room.gameId && !observer.roomId) observer.peer.send({ type: 'lobby_update', change: 'remove', room: oldSummary, lobbyRevision: this.lobbyRevision });
         this.publish(room, 'updated');
         if (!wasPublic && room.visibility === 'public') this.broadcastLobby(room, 'add');
@@ -498,7 +584,7 @@ export class RoomManager {
     }
     await this.serialized(() => {
       this.requireSession(peer); const room = this.requireRoom(session);
-      if (message.type === 'ready') { if (session.role === 'spectator') throw new ProtocolError('forbidden'); if (room.state !== 'open') throw new ProtocolError('invalid_state'); this.commit(room); session.ready = message.ready; this.publish(room, 'ready'); return; }
+      if (message.type === 'ready') { if (session.role === 'spectator') throw new ProtocolError('forbidden'); if (room.state !== 'open') throw new ProtocolError('invalid_state'); const previous = session.ready ?? false; session.ready = message.ready; try { this.commit(room); } catch (error) { session.ready = previous; throw error; } this.publish(room, 'ready'); return; }
       this.host(session, room);
       if (message.type === 'delete_room') { this.closeRoom(room, 'deleted', peer); return; }
       if (message.type === 'transfer_host') { const target = room.players.get(message.playerId); if (!target || !this.connected(target) || target.role === 'spectator') throw new ProtocolError('forbidden'); this.commit(room, { hostId: message.playerId }); this.publish(room, 'host'); return; }
@@ -516,7 +602,8 @@ export class RoomManager {
         if (this.invitations.size >= this.config.limits.maxConnections * 4) throw new ProtocolError('rate_limited');
         const token = randomUUID(); const expiresAt = Date.now() + this.config.lobby.inviteTtlMs;
         this.commit(room, { invitedIds: [...new Set([...room.invitedIds, message.playerId])] });
-        for (const [oldToken, invitation] of this.invitations) if (invitation.roomId === room.id && invitation.target === message.playerId) this.invitations.delete(oldToken);
+        for (const [oldToken, invitation] of this.invitations) if (invitation.roomId === room.id && invitation.target === message.playerId) { try { this.persist(() => this.store.deleteInvitation(oldToken)); } catch { log('error', 'invitation_cleanup_failed'); } this.invitations.delete(oldToken); }
+        this.persist(() => this.store.saveInvitation({ token, target: message.playerId, expiresAt, roomId: room.id }));
         this.invitations.set(token, { target: message.playerId, expiresAt, roomId: room.id });
         const invitation = { type: 'room_invitation', roomId: room.id, playerId: message.playerId, invitationToken: token, expiresAt };
         reply(peer, invitation); const target = this.players.get(message.playerId); if (target && this.connected(target)) target.peer.send(invitation); return;
@@ -549,9 +636,9 @@ export class RoomManager {
   private leaveParty(id: string): void {
     const party = this.party(id); if (!party) return;
     this.cancelQueue(id); party.members.delete(id); this.partyOf.delete(id);
-    for (const [token, invitation] of this.invitations) if (invitation.partyId === party.id) this.invitations.delete(token);
-    if (!party.members.size) this.parties.delete(party.id);
-    else { if (party.leaderId === id) party.leaderId = party.members.values().next().value!; this.publishParty(party); }
+    for (const [token, invitation] of this.invitations) if (invitation.partyId === party.id) { try { this.persist(() => this.store.deleteInvitation(token)); } catch { log('error', 'invitation_cleanup_failed'); } this.invitations.delete(token); }
+    if (!party.members.size) { this.persist(() => this.store.deleteParty(party.id)); this.parties.delete(party.id); }
+    else { if (party.leaderId === id) party.leaderId = party.members.values().next().value!; this.persist(() => this.store.saveParty({ id: party.id, leaderId: party.leaderId, members: [...party.members] })); this.publishParty(party); }
     this.sendParty(id);
   }
   private socialCommand(session: Session & { player: Player }, message: Exclude<ClientMessage, { type: 'auth' }>): void {
@@ -561,7 +648,7 @@ export class RoomManager {
       if (message.playerId === id) throw new ProtocolError('bad_request');
       const key = this.socialKey(id, message.playerId); const existing = this.social.get(key);
       if (message.type === 'friend_request') {
-        if (existing) throw new ProtocolError('invalid_state');
+        if (existing || this.blocked(id, message.playerId)) throw new ProtocolError(existing ? 'invalid_state' : 'forbidden');
         if ([id, message.playerId].some(playerId => [...this.social.values()].filter(link => link.a === playerId || link.b === playerId).length >= 100)) throw new ProtocolError('rate_limited');
         const [a, b] = [id, message.playerId].sort() as [string, string]; const link: SocialLink = { a, b, status: 'pending', requestedBy: id };
         this.persist(() => this.store.saveSocial(link)); this.social.set(key, link);
@@ -572,13 +659,14 @@ export class RoomManager {
       } else { this.persist(() => this.store.deleteSocial(id, message.playerId)); this.social.delete(key); }
       this.sendFriends(session); const other = this.players.get(message.playerId); if (other && this.connected(other)) this.sendFriends(other, false); return;
     }
-    if (message.type === 'party_create') { this.available(); if (this.party(id)) throw new ProtocolError('invalid_state'); this.cancelQueue(id); const party: Party = { id: randomUUID(), leaderId: id, members: new Set([id]) }; this.parties.set(party.id, party); this.partyOf.set(id, party.id); this.sendParty(id, true); return; }
+    if (message.type === 'party_create') { this.available(); if (this.party(id)) throw new ProtocolError('invalid_state'); this.cancelQueue(id); const party: Party = { id: randomUUID(), leaderId: id, members: new Set([id]) }; this.persist(() => this.store.saveParty({ id: party.id, leaderId: id, members: [id] })); this.parties.set(party.id, party); this.partyOf.set(id, party.id); this.sendParty(id, true); return; }
     if (message.type === 'party_leave') { if (!this.party(id)) throw new ProtocolError('not_in_party'); this.leaveParty(id); this.sendParty(id, true); return; }
     if (message.type === 'party_invite') {
       const party = this.party(id); if (!party) throw new ProtocolError('not_in_party'); if (party.leaderId !== id) throw new ProtocolError('forbidden'); if (party.members.size >= this.config.lobby.maxPartySize) throw new ProtocolError('party_full');
       if (this.invitations.size >= this.config.limits.maxConnections * 4) throw new ProtocolError('rate_limited');
-      for (const [token, invitation] of this.invitations) if (invitation.partyId === party.id && invitation.target === message.playerId) this.invitations.delete(token);
+      for (const [token, invitation] of this.invitations) if (invitation.partyId === party.id && invitation.target === message.playerId) { try { this.persist(() => this.store.deleteInvitation(token)); } catch { log('error', 'invitation_cleanup_failed'); } this.invitations.delete(token); }
       const token = randomUUID(); const expiresAt = Date.now() + this.config.lobby.inviteTtlMs;
+      this.persist(() => this.store.saveInvitation({ token, target: message.playerId, expiresAt, partyId: party.id }));
       this.invitations.set(token, { target: message.playerId, partyId: party.id, expiresAt });
       const invitation = { type: 'party_invitation', partyId: party.id, playerId: message.playerId, invitationToken: token, expiresAt }; reply(session.peer, invitation); const target = this.players.get(message.playerId); if (target && this.connected(target)) target.peer.send(invitation); return;
     }
@@ -586,7 +674,10 @@ export class RoomManager {
       this.available(); const invitation = this.invitations.get(message.invitationToken);
       if (!invitation || invitation.expiresAt <= Date.now()) throw new ProtocolError('invitation_expired'); if (invitation.target !== id || !invitation.partyId) throw new ProtocolError('forbidden');
       const party = this.parties.get(invitation.partyId); if (!party) throw new ProtocolError('not_in_party'); if (this.party(id) || session.roomId) throw new ProtocolError('invalid_state'); if (party.members.size >= this.config.lobby.maxPartySize) throw new ProtocolError('party_full');
-      this.cancelQueue(id); this.cancelQueue(party.leaderId); party.members.add(id); this.partyOf.set(id, party.id); this.invitations.delete(message.invitationToken); this.publishParty(party); this.sendParty(id, true); return;
+      this.cancelQueue(id); this.cancelQueue(party.leaderId); party.members.add(id);
+      try { this.persist(() => this.store.saveParty({ id: party.id, leaderId: party.leaderId, members: [...party.members] })); this.persist(() => this.store.deleteInvitation(message.invitationToken)); }
+      catch (error) { party.members.delete(id); throw error; }
+      this.partyOf.set(id, party.id); this.invitations.delete(message.invitationToken); this.publishParty(party); this.sendParty(id, true); return;
     }
     if (message.type === 'queue_leave') { this.cancelQueue(id); reply(session.peer, { type: 'queue_state', queued: false, reason: 'cancelled' }); return; }
     throw new ProtocolError('bad_request');
@@ -621,6 +712,7 @@ export class RoomManager {
       // Insert must succeed before queue removal or membership changes: the party cannot be split on disk failure.
       const room = this.newRoom(leader as Session & { player: Player }, game, 'Matchmaking', { ...first.compatibility, maxPlayers: max }, false);
       for (const id of ids.slice(1)) { const member = this.players.get(id)!; room.players.set(id, member); member.roomId = room.id; member.ready = false; member.role = 'player'; }
+      this.commit(room);
       for (const id of ids) this.sendMembers(this.players.get(id)!.peer, { type: 'room_joined', room: this.summary(room), revision: room.revision, lobbyRevision: this.lobbyRevision }, this.members(room), false);
       this.broadcastLobby(room, 'add');
       for (const entry of batch) this.waiting.splice(this.waiting.indexOf(entry), 1);
@@ -633,7 +725,7 @@ export class RoomManager {
     this.maintenance = enabled;
     if (enabled) void this.serialized(() => { for (const entry of [...this.waiting]) this.cancelQueue(entry.members[0]!, 'maintenance'); }).catch(() => log('error', 'maintenance_cleanup_failed'));
   }
-  stats(): Record<string, unknown> { return { connections: [...this.sessions.values()].filter(session => this.connected(session)).length, players: this.players.size, rooms: this.rooms.size, disconnectedReservations: [...this.players.values()].filter(session => !this.connected(session) && session.roomId).length, storageHealthy: this.storageHealthy, lobbyRevision: this.lobbyRevision, queuedPlayers: this.waiting.reduce((sum, entry) => sum + entry.members.length, 0), parties: this.parties.size, maintenance: this.maintenance, matches: [...this.rooms.values()].filter(room => room.state === 'in_game').length }; }
+  stats(): Record<string, unknown> { return { connections: [...this.sessions.values()].filter(session => this.connected(session)).length, players: this.players.size, rooms: this.rooms.size, disconnectedReservations: [...this.players.values()].filter(session => !this.connected(session) && session.roomId).length + [...this.rooms.values()].reduce((sum, room) => sum + room.held.size, 0), storageHealthy: this.storageHealthy, lobbyRevision: this.lobbyRevision, queuedPlayers: this.waiting.reduce((sum, entry) => sum + entry.members.length, 0), parties: this.parties.size, maintenance: this.maintenance, matches: [...this.rooms.values()].filter(room => room.state === 'in_game').length }; }
   private adminRecord(playerId: string, patch: Partial<Moderation>, action: string): void {
     const record: Moderation = { playerId, bannedUntil: 0, revokedBefore: 0, reason: '', ...this.moderation.get(playerId), ...patch };
     this.persist(() => this.store.saveModeration(record)); this.moderation.set(playerId, record);
@@ -654,17 +746,62 @@ export class RoomManager {
       for (const session of [...this.players.values()]) { const player = session.player!; if ((record.tokenId && player.tokenId === record.tokenId) || (record.playerId === player.id && (record.revokedBefore === undefined || player.issuedAt === undefined || player.issuedAt <= record.revokedBefore))) this.expel(player.id, 'token_revoked'); }
     } });
   }
+  private releaseHeld(room: Room, playerId: string): void {
+    const seat = room.held.get(playerId); if (!seat) return;
+    room.held.delete(playerId); room.pendingResults.delete(playerId);
+    const next = [...room.players.values()].find(member => member.role !== 'spectator' && member.player);
+    const heldHost = [...room.held.values()].find(item => item.role !== 'spectator');
+    const hostId = room.hostId === playerId ? next?.player?.id ?? heldHost?.playerId ?? room.ownerId : room.hostId;
+    if (!room.players.size && !room.held.size && !room.reservations.size && room.emptySince === null) room.emptySince = Date.now();
+    try { this.commit(room, hostId === room.hostId ? {} : { hostId }); }
+    catch (error) { room.held.set(playerId, seat); throw error; }
+    this.publish(room, 'leave');
+  }
+  private finishMatch(room: Room, state: 'ended' | 'failed'): void {
+    const matchId = room.matchId;
+    if (matchId) room.recentMatchId = matchId;
+    const previous = [...room.players.values()].map(member => [member, member.ready] as const);
+    const heldReady = [...room.held.values()].map(seat => [seat, seat.ready] as const);
+    for (const member of room.players.values()) member.ready = false;
+    for (const seat of room.held.values()) seat.ready = false;
+    try { this.commit(room, { state: 'open', matchId: null }); }
+    catch (error) { for (const [member, ready] of previous) member.ready = ready ?? false; for (const [seat, ready] of heldReady) seat.ready = ready; throw error; }
+    if (matchId) this.finishedMatches.set(matchId, Date.now());
+    this.publish(room, state);
+  }
+  async reportMatch(matchId: string, state: 'ended' | 'failed'): Promise<void> {
+    await this.serialized(() => {
+      if (this.finishedMatches.has(matchId)) return;
+      const room = [...this.rooms.values()].find(item => item.matchId === matchId && (item.state === 'in_game' || item.state === 'starting') && !item.operation);
+      if (!room) throw new ProtocolError('room_not_found');
+      this.finishMatch(room, state);
+      this.persist(() => this.store.audit({ at: Date.now(), actor: 'game', action: 'match_result', target: matchId }));
+    });
+  }
+  async reportPlayerResult(matchId: string, playerId: string, result: Rules): Promise<void> {
+    await this.serialized(() => {
+      const room = [...this.rooms.values()].find(item => item.matchId === matchId || item.recentMatchId === matchId);
+      if (!room) throw new ProtocolError('room_not_found');
+      const member = room.players.get(playerId); const held = room.held.get(playerId);
+      if (!member && !held) throw new ProtocolError('room_not_found');
+      if (member && this.connected(member)) member.peer.send({ type: 'match_result', roomId: room.id, matchId, result });
+      else { room.pendingResults.set(playerId, { matchId, result }); if (held) held.pendingResult = { matchId, result }; this.commit(room); }
+      this.persist(() => this.store.audit({ at: Date.now(), actor: 'game', action: 'match_player_result', target: matchId }));
+    });
+  }
   async maintain(now = Date.now()): Promise<void> {
     await this.serialized(() => {
       if (this.stopped) return;
+      for (const [id, at] of this.finishedMatches) if (now - at > 3_600_000) this.finishedMatches.delete(id);
       for (const session of this.sessions.values()) if ((!this.connected(session)) && session.disconnectedAt !== undefined && now - session.disconnectedAt >= this.config.lobby.reconnectGraceMs) { try { this.removeDisconnected(session); } catch { log('error', 'disconnect_cleanup_deferred'); } }
-      for (const [token, invitation] of this.invitations) if (invitation.expiresAt <= now) this.invitations.delete(token);
+      for (const [token, invitation] of this.invitations) if (invitation.expiresAt <= now) { try { this.persist(() => this.store.deleteInvitation(token)); } catch { log('error', 'invitation_cleanup_failed'); } this.invitations.delete(token); }
       for (const [id, snapshot] of this.snapshots) if (snapshot.expiresAt <= now) this.snapshots.delete(id);
       for (const [cursor, record] of this.cursors) if (!this.snapshots.has(record.snapshotId)) this.cursors.delete(cursor);
       for (const [id, failure] of this.passwordFailures) if (!failure.pending && now - failure.startedAt >= this.config.limits.passwordWindowMs) this.passwordFailures.delete(id);
       for (const entry of [...this.waiting]) if (now - entry.at >= this.config.lobby.matchmakingWaitMs) { for (const id of entry.members) this.players.get(id)?.peer.send(errorMessage('queue_timeout')); this.cancelQueue(entry.members[0]!, 'timeout'); }
       for (const room of [...this.rooms.values()]) {
-        if (!room.players.size && !room.reservations.size && room.emptySince !== null && this.config.room.emptyTtlSec > 0 && now - room.emptySince >= this.config.room.emptyTtlSec * 1000 && room.state === 'open') { try { this.closeRoom(room, 'expired'); } catch { log('error', 'room_expiry_deferred'); } }
+        for (const [id, seat] of [...room.held]) if (seat.expiresAt <= now) { try { this.releaseHeld(room, id); } catch { log('error', 'seat_expiry_deferred'); } }
+        if (!room.players.size && !room.reservations.size && !room.held.size && room.emptySince !== null && this.config.room.emptyTtlSec > 0 && now - room.emptySince >= this.config.room.emptyTtlSec * 1000 && room.state === 'open') { try { this.closeRoom(room, 'expired'); } catch { log('error', 'room_expiry_deferred'); } }
         if ((room.state === 'starting' || room.state === 'in_game') && !room.operation && !this.recovering.has(room.id)) {
           if (!room.matchId) {
             const request = room.matchRequest;
@@ -675,11 +812,8 @@ export class RoomManager {
                 const state = await this.provider.status(allocation.matchId);
                 await this.serialized(() => {
                   if (this.stopped || this.rooms.get(room.id) !== room || room.matchRequest?.operationId !== request.operationId || room.state !== 'starting') throw new ProtocolError('invalid_state');
-                  if (state === 'ended' || state === 'failed') {
-                    this.commit(room, { state: 'open', matchId: null });
-                    for (const member of room.players.values()) member.ready = false;
-                    this.publish(room, state);
-                  } else {
+                  if (state === 'ended' || state === 'failed') this.finishMatch(room, state);
+                  else {
                     this.commit(room, { state, matchId: allocation.matchId }); this.publish(room, 'recovered');
                     if (state === 'in_game') this.recoverAdmissions(room, allocation.matchId);
                   }
@@ -694,7 +828,7 @@ export class RoomManager {
           const matchId = room.matchId; this.recovering.add(room.id);
           void this.track(Promise.resolve().then(() => this.provider.status(matchId)).then(state => this.serialized(() => {
             if (this.stopped || this.rooms.get(room.id) !== room || room.matchId !== matchId) return;
-            if (state === 'ended' || state === 'failed') { this.commit(room, { state: 'open', matchId: null }); for (const member of room.players.values()) member.ready = false; this.publish(room, state); }
+            if (state === 'ended' || state === 'failed') this.finishMatch(room, state);
             else if (room.state !== state) { this.commit(room, { state }); this.publish(room, 'recovered'); if (state === 'in_game') this.recoverAdmissions(room, matchId); }
           }))).catch(() => log('error', 'match_status_unavailable')).finally(() => this.recovering.delete(room.id));
         }
@@ -703,7 +837,19 @@ export class RoomManager {
   }
   async close(): Promise<void> {
     this.stopped = true;
-    await this.serialized(() => { for (const entry of [...this.waiting]) this.cancelQueue(entry.members[0]!, 'shutdown'); this.parties.clear(); this.partyOf.clear(); this.invitations.clear(); this.snapshots.clear(); this.cursors.clear(); });
+    await this.serialized(() => {
+      for (const entry of [...this.waiting]) this.cancelQueue(entry.members[0]!, 'shutdown');
+      if (this.config.lobby.reconnectGraceMs > 0) {
+        const now = Date.now();
+        for (const room of this.rooms.values()) {
+          if (!room.players.size && !room.held.size) continue;
+          for (const session of room.players.values()) { session.active = false; session.disconnectedAt = session.disconnectedAt ?? now; }
+          for (const seat of room.held.values()) seat.expiresAt = Math.max(seat.expiresAt, now + this.config.lobby.reconnectGraceMs);
+          try { this.commit(room); } catch { log('error', 'seat_flush_failed'); }
+        }
+      }
+      this.parties.clear(); this.partyOf.clear(); this.invitations.clear(); this.snapshots.clear(); this.cursors.clear();
+    });
     do { await Promise.allSettled([...this.external]); await this.queue; } while (this.external.size);
   }
   async settle(): Promise<void> { await this.queue; }

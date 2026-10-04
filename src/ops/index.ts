@@ -1,6 +1,8 @@
 import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { createHash, timingSafeEqual } from 'node:crypto';
+import { ProtocolError } from '../protocol/index.js';
+import { readRules } from '../protocol/index.js';
 import { lstatSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import type { Config } from '../config.js';
@@ -15,6 +17,8 @@ export interface OperationsHooks {
   unban(playerId: string): Promise<void>;
   revoke(playerId: string, before: number): Promise<void>;
   closeRoom(roomId: string): Promise<void>;
+  reportMatch(matchId: string, state: 'ended' | 'failed'): Promise<void>;
+  reportPlayerResult(matchId: string, playerId: string, result: Record<string, string | number | boolean>): Promise<void>;
   maintenance(enabled: boolean): void;
   audit(limit: number): unknown[];
 }
@@ -167,6 +171,21 @@ export async function startOperations(config: Config, hooks: OperationsHooks): P
           case '/rooms/close':
             fields(input, ['roomId']); if (!id(input.roomId)) throw new Error('Invalid request');
             await hooks.closeRoom(input.roomId); break;
+          case '/matches/result':
+            fields(input, ['matchId', 'state']);
+            if (!id(input.matchId) || (input.state !== 'ended' && input.state !== 'failed')) throw new Error('Invalid request');
+            try { await hooks.reportMatch(input.matchId, input.state); }
+            catch (error) { if (error instanceof ProtocolError && error.code === 'room_not_found') { reply(response, 404, { error: 'not_found' }); return; } throw error; }
+            break;
+          case '/matches/player-result': {
+            fields(input, ['matchId', 'playerId', 'result']);
+            if (!id(input.matchId) || !playerId(input.playerId)) throw new Error('Invalid request');
+            let result: Record<string, string | number | boolean>;
+            try { result = readRules(input.result); } catch { throw new Error('Invalid request'); }
+            try { await hooks.reportPlayerResult(input.matchId, input.playerId, result); }
+            catch (error) { if (error instanceof ProtocolError && error.code === 'room_not_found') { reply(response, 404, { error: 'not_found' }); return; } throw error; }
+            break;
+          }
           case '/maintenance':
             fields(input, ['enabled']); if (typeof input.enabled !== 'boolean') throw new Error('Invalid request');
             hooks.maintenance(input.enabled); break;

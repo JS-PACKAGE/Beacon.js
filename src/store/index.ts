@@ -1,7 +1,8 @@
 import { DatabaseSync } from 'node:sqlite';
 import { chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { AuditEvent, Moderation, RoomStore, SocialLink, StoredRoom } from '../types.js';
+import type { AuditEvent, Moderation, PlayerBlock, RoomStore, SocialLink, StoredInvitation, StoredParty, StoredRoom, ReconnectSeat } from '../types.js';
+import { readRules } from '../protocol/index.js';
 
 function text(value: unknown, max = 128, empty = false): value is string {
   return typeof value === 'string' && (empty || value.length > 0) && Buffer.byteLength(value) <= max && !/[\p{Cc}\p{Cs}]/u.test(value);
@@ -11,7 +12,21 @@ function roomValid(room: StoredRoom): void {
   if (!text(room.id) || !/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/.test(room.id) || !text(room.gameId) || !/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/.test(room.gameId) || !text(room.name, 128) || [...room.name].length > 32 || !text(room.ownerId) || !text(room.hostId) || !(room.passwordHash === null || text(room.passwordHash, 512)) || !integer(room.maxPlayers, 1) || !['open', 'starting', 'in_game', 'closed'].includes(room.state) || !['public', 'unlisted', 'invite'].includes(room.visibility) || typeof room.locked !== 'boolean' || ![room.version, room.mode, room.region].every(v => text(v, 64, true)) || !['closed', 'fill', 'spectate'].includes(room.joinPolicy) || !integer(room.maxSpectators) || !integer(room.revision, 1) || ![room.bannedIds, room.invitedIds].every(v => Array.isArray(v) && v.length <= 10000 && v.every(id => text(id)) && new Set(v).size === v.length) || !(room.matchId === null || text(room.matchId)) || !integer(room.createdAt) || !integer(room.updatedAt)) throw new Error('Invalid persisted room data');
   if (room.matchRequest !== undefined) {
     const request = room.matchRequest;
-    if (!request || typeof request !== 'object' || Object.keys(request).some(key => !['operationId', 'roomId', 'gameId', 'players', 'version', 'mode', 'region'].includes(key)) || !text(request.operationId) || request.roomId !== room.id || request.gameId !== room.gameId || request.version !== room.version || request.mode !== room.mode || request.region !== room.region || !Array.isArray(request.players) || !request.players.length || !request.players.every(player => player && typeof player === 'object' && Object.keys(player).length === 2 && text(player.id) && (player.role === 'player' || player.role === 'spectator')) || new Set(request.players.map(player => player.id)).size !== request.players.length || Buffer.byteLength(JSON.stringify(request)) > 262144) throw new Error('Invalid persisted match request');
+    if (!request || typeof request !== 'object' || Object.keys(request).some(key => !['operationId', 'roomId', 'gameId', 'players', 'version', 'mode', 'region', 'rules'].includes(key)) || !text(request.operationId) || request.roomId !== room.id || request.gameId !== room.gameId || request.version !== room.version || request.mode !== room.mode || request.region !== room.region || !Array.isArray(request.players) || !request.players.length || !request.players.every(player => player && typeof player === 'object' && Object.keys(player).length === 2 && text(player.id) && (player.role === 'player' || player.role === 'spectator')) || new Set(request.players.map(player => player.id)).size !== request.players.length || Buffer.byteLength(JSON.stringify(request)) > 262144) throw new Error('Invalid persisted match request');
+    if (request.rules !== undefined) { try { if (JSON.stringify(readRules(request.rules)) !== JSON.stringify(room.rules)) throw new Error('Invalid persisted match request'); } catch { throw new Error('Invalid persisted match request'); } }
+  }
+  if (room.rules !== undefined) { try { if (JSON.stringify(readRules(room.rules)) !== JSON.stringify(room.rules)) throw new Error('Invalid persisted room data'); } catch { throw new Error('Invalid persisted room data'); } }
+  if (room.seats !== undefined) seatsValid(room.seats, room.maxPlayers + room.maxSpectators);
+}
+function seatsValid(seats: ReconnectSeat[], max: number): void {
+  if (!Array.isArray(seats) || seats.length > max || new Set(seats.map(seat => seat.playerId)).size !== seats.length) throw new Error('Invalid persisted room data');
+  for (const seat of seats) {
+    if (!seat || typeof seat !== 'object' || Object.keys(seat).some(key => !['playerId', 'role', 'ready', 'gameId', 'version', 'mode', 'region', 'displayName', 'expiresAt', 'pendingResult'].includes(key)) || !text(seat.playerId) || (seat.role !== 'player' && seat.role !== 'spectator') || typeof seat.ready !== 'boolean' || !text(seat.gameId) || ![seat.version, seat.mode, seat.region].every(value => text(value, 64, true)) || !text(seat.displayName) || !integer(seat.expiresAt)) throw new Error('Invalid persisted room data');
+    if (seat.pendingResult !== undefined) {
+      const pending = seat.pendingResult;
+      if (!pending || typeof pending !== 'object' || Object.keys(pending).some(key => key !== 'matchId' && key !== 'result') || !text(pending.matchId)) throw new Error('Invalid persisted room data');
+      try { if (JSON.stringify(readRules(pending.result)) !== JSON.stringify(pending.result)) throw new Error('Invalid persisted room data'); } catch { throw new Error('Invalid persisted room data'); }
+    }
   }
 }
 function moderationValid(value: Moderation): void {
@@ -20,12 +35,22 @@ function moderationValid(value: Moderation): void {
 function socialValid(value: SocialLink): void {
   if (!text(value.a) || !text(value.b) || value.a === value.b || !['pending', 'accepted'].includes(value.status) || (value.requestedBy !== value.a && value.requestedBy !== value.b)) throw new Error('Invalid social data');
 }
+function partyValid(value: StoredParty): void {
+  if (!text(value.id) || !text(value.leaderId) || !Array.isArray(value.members) || value.members.length < 1 || value.members.length > 128 || !value.members.every(id => text(id)) || new Set(value.members).size !== value.members.length || !value.members.includes(value.leaderId)) throw new Error('Invalid party data');
+}
+function invitationValid(value: StoredInvitation): void {
+  const keys = Object.keys(value);
+  if (!text(value.token) || !text(value.target) || !integer(value.expiresAt, 1) || keys.some(key => !['token', 'target', 'expiresAt', 'roomId', 'partyId'].includes(key)) || (value.roomId === undefined) === (value.partyId === undefined) || (value.roomId !== undefined && !text(value.roomId)) || (value.partyId !== undefined && !text(value.partyId))) throw new Error('Invalid invitation data');
+}
+function blockValid(value: PlayerBlock): void {
+  if (!text(value.playerId) || !text(value.targetId) || value.playerId === value.targetId || Object.keys(value).some(key => key !== 'playerId' && key !== 'targetId')) throw new Error('Invalid block data');
+}
 function auditValid(value: AuditEvent): void {
   if (!integer(value.at) || !text(value.actor) || !text(value.action) || !text(value.target, 256, true)) throw new Error('Invalid audit data');
 }
 function metadata(room: StoredRoom): string {
-  const { ownerId, visibility, locked, version, mode, region, joinPolicy, maxSpectators, revision, bannedIds, invitedIds, matchId, matchRequest } = room;
-  return JSON.stringify({ ownerId, visibility, locked, version, mode, region, joinPolicy, maxSpectators, revision, bannedIds, invitedIds, matchId, ...(matchRequest === undefined ? {} : { matchRequest }) });
+  const { ownerId, visibility, locked, version, mode, region, joinPolicy, maxSpectators, revision, bannedIds, invitedIds, matchId, matchRequest, rules, seats } = room;
+  return JSON.stringify({ ownerId, visibility, locked, version, mode, region, joinPolicy, maxSpectators, revision, bannedIds, invitedIds, matchId, ...(matchRequest === undefined ? {} : { matchRequest }), ...(rules === undefined ? {} : { rules }), ...(seats?.length ? { seats } : {}) });
 }
 export class SqliteRoomStore implements RoomStore {
   private readonly db: DatabaseSync;
@@ -46,7 +71,7 @@ export class SqliteRoomStore implements RoomStore {
       try {
         db.exec('CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL) STRICT');
         const versions = db.prepare('SELECT version FROM schema_migrations ORDER BY version').all();
-        if (versions.some(row => row.version !== 1 && row.version !== 2) || (versions.length && versions[0]?.version !== 1)) throw new Error('Unsupported schema version');
+        if (versions.some(row => row.version !== 1 && row.version !== 2 && row.version !== 3) || (versions.length && versions[0]?.version !== 1)) throw new Error('Unsupported schema version');
         if (!versions.length) {
           db.exec(`CREATE TABLE rooms (
             id TEXT PRIMARY KEY, game_id TEXT NOT NULL, name TEXT NOT NULL,
@@ -71,8 +96,14 @@ export class SqliteRoomStore implements RoomStore {
           CREATE TABLE audit_events(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,actor TEXT NOT NULL,action TEXT NOT NULL,target TEXT NOT NULL) STRICT;`);
           db.prepare('INSERT INTO schema_migrations VALUES(2, ?)').run(Date.now());
         }
+        if (!versions.some(row => row.version === 3)) {
+          db.exec(`CREATE TABLE parties(id TEXT PRIMARY KEY, leader_id TEXT NOT NULL, members TEXT NOT NULL CHECK(json_valid(members))) STRICT;
+          CREATE TABLE invitations(token TEXT PRIMARY KEY, target TEXT NOT NULL, expires_at INTEGER NOT NULL, room_id TEXT, party_id TEXT) STRICT;
+          CREATE TABLE blocks(player_id TEXT NOT NULL, target_id TEXT NOT NULL, PRIMARY KEY(player_id, target_id), CHECK(player_id != target_id)) STRICT;`);
+          db.prepare('INSERT INTO schema_migrations VALUES(3, ?)').run(Date.now());
+        }
         this.db = db;
-        this.load(); this.listModeration(); this.listSocial(); this.listAudit(1000);
+        this.load(); this.listModeration(); this.listSocial(); this.listParties(); this.listInvitations(); this.listBlocks(); this.listAudit(1000);
         db.exec('COMMIT');
       } catch (error) { if (db.isTransaction) db.exec('ROLLBACK'); throw error; }
       for (const suffix of ['-wal', '-shm']) if (existsSync(path + suffix)) chmodSync(path + suffix, 0o600);
@@ -86,7 +117,7 @@ export class SqliteRoomStore implements RoomStore {
       if (typeof row.metadata !== 'string' || Buffer.byteLength(row.metadata) > 3000000) throw new Error('Invalid persisted room data');
       const data: unknown = JSON.parse(row.metadata);
       if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('Invalid persisted room data');
-      const allowed = ['ownerId', 'visibility', 'locked', 'version', 'mode', 'region', 'joinPolicy', 'maxSpectators', 'revision', 'bannedIds', 'invitedIds', 'matchId', 'matchRequest'];
+      const allowed = ['ownerId', 'visibility', 'locked', 'version', 'mode', 'region', 'joinPolicy', 'maxSpectators', 'revision', 'bannedIds', 'invitedIds', 'matchId', 'matchRequest', 'rules', 'seats'];
       if (Object.keys(data).some(key => !allowed.includes(key))) throw new Error('Invalid persisted room metadata');
       const room = { ...data, id: row.id, gameId: row.game_id, name: row.name, hostId: row.host_id, passwordHash: row.password_hash, maxPlayers: row.max_players, state: row.state, createdAt: row.created_at, updatedAt: row.updated_at } as StoredRoom;
       roomValid(room);
@@ -132,6 +163,46 @@ export class SqliteRoomStore implements RoomStore {
   deleteSocial(a: string, b: string): void {
     if (!text(a) || !text(b) || a === b) throw new Error('Invalid social data');
     this.commit(() => { this.db.prepare('DELETE FROM social WHERE a=? AND b=?').run(a < b ? a : b, a < b ? b : a); });
+  }
+  listParties(): StoredParty[] {
+    return this.db.prepare('SELECT id, leader_id AS leaderId, members FROM parties ORDER BY id').all().map(row => {
+      const members: unknown = JSON.parse(String(row.members));
+      const party = { id: row.id, leaderId: row.leaderId, members } as StoredParty;
+      partyValid(party); return party;
+    });
+  }
+  saveParty(party: StoredParty): void {
+    partyValid(party);
+    this.commit(() => { this.db.prepare('INSERT INTO parties VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET leader_id=excluded.leader_id, members=excluded.members').run(party.id, party.leaderId, JSON.stringify(party.members)); });
+  }
+  deleteParty(id: string): void {
+    if (!text(id)) throw new Error('Invalid party data');
+    this.commit(() => { this.db.prepare('DELETE FROM parties WHERE id=?').run(id); });
+  }
+  listInvitations(): StoredInvitation[] {
+    return this.db.prepare('SELECT token, target, expires_at AS expiresAt, room_id AS roomId, party_id AS partyId FROM invitations ORDER BY token').all().map(row => {
+      const invitation: StoredInvitation = { token: String(row.token), target: String(row.target), expiresAt: Number(row.expiresAt), ...(row.roomId ? { roomId: String(row.roomId) } : {}), ...(row.partyId ? { partyId: String(row.partyId) } : {}) };
+      invitationValid(invitation); return invitation;
+    });
+  }
+  saveInvitation(invitation: StoredInvitation): void {
+    invitationValid(invitation);
+    this.commit(() => { this.db.prepare('INSERT INTO invitations VALUES(?,?,?,?,?) ON CONFLICT(token) DO UPDATE SET target=excluded.target, expires_at=excluded.expires_at, room_id=excluded.room_id, party_id=excluded.party_id').run(invitation.token, invitation.target, invitation.expiresAt, invitation.roomId ?? null, invitation.partyId ?? null); });
+  }
+  deleteInvitation(token: string): void {
+    if (!text(token)) throw new Error('Invalid invitation data');
+    this.commit(() => { this.db.prepare('DELETE FROM invitations WHERE token=?').run(token); });
+  }
+  listBlocks(): PlayerBlock[] {
+    return this.db.prepare('SELECT player_id AS playerId, target_id AS targetId FROM blocks ORDER BY player_id, target_id').all().map(row => { const block = { ...row } as unknown as PlayerBlock; blockValid(block); return block; });
+  }
+  saveBlock(block: PlayerBlock): void {
+    blockValid(block);
+    this.commit(() => { this.db.prepare('INSERT INTO blocks VALUES(?,?) ON CONFLICT DO NOTHING').run(block.playerId, block.targetId); });
+  }
+  deleteBlock(playerId: string, targetId: string): void {
+    if (!text(playerId) || !text(targetId) || playerId === targetId) throw new Error('Invalid block data');
+    this.commit(() => { this.db.prepare('DELETE FROM blocks WHERE player_id=? AND target_id=?').run(playerId, targetId); });
   }
   audit(event: AuditEvent): void {
     auditValid(event);

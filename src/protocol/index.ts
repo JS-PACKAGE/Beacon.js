@@ -1,3 +1,4 @@
+import type { Rules } from '../types.js';
 export const PROTOCOL_VERSION = 2;
 export const ERROR_MESSAGES = {
   auth_required: 'Authentication is required', auth_failed: 'Authentication failed', auth_expired: 'Authentication expired',
@@ -22,6 +23,25 @@ export interface RoomFilters extends Compatibility { query?: string; availableOn
 export interface RoomSettings {
   name?: string; password?: string; maxPlayers?: number; visibility?: 'public' | 'unlisted' | 'invite';
   locked?: boolean; joinPolicy?: 'closed' | 'fill' | 'spectate'; maxSpectators?: number;
+  rules?: Rules;
+}
+const secretKey = /password|token|ticket|secret|authorization/i;
+/** Flat, bounded room rules. `map` is the conventional key when a game needs a map id. */
+export function readRules(value: unknown): Rules {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid rules');
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length > 16) throw new Error('Invalid rules');
+  const rules: Rules = {};
+  for (const [key, item] of entries) {
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,31}$/.test(key) || secretKey.test(key)) throw new Error('Invalid rules');
+    if (typeof item === 'string') {
+      if ([...item].length > 128 || /[\p{Cc}\p{Cs}]/u.test(item)) throw new Error('Invalid rules');
+      rules[key] = item;
+    } else if (typeof item === 'boolean' || (typeof item === 'number' && Number.isSafeInteger(item))) rules[key] = item;
+    else throw new Error('Invalid rules');
+  }
+  if (Buffer.byteLength(JSON.stringify(rules)) > 1024) throw new Error('Invalid rules');
+  return rules;
 }
 type Command =
   | { type: 'auth'; token: string; protocolVersion?: number }
@@ -43,8 +63,8 @@ export type ClientMessage = Command & { requestId?: string };
 
 const compatibility = ['version', 'mode', 'region'];
 const filters = [...compatibility, 'query', 'availableOnly', 'sort'];
-const settings = ['name', 'password', 'maxPlayers', 'visibility', 'locked', 'joinPolicy', 'maxSpectators'];
-const fields: Record<ClientMessage['type'], readonly string[]> = {
+const settings = ['name', 'password', 'maxPlayers', 'visibility', 'locked', 'joinPolicy', 'maxSpectators', 'rules'];
+export const CLIENT_FIELDS: Record<ClientMessage['type'], readonly string[]> = {
   auth: ['token', 'protocolVersion'], refresh_auth: ['token'], select_game: ['gameId', ...compatibility], switch_game: ['gameId', ...compatibility],
   list_rooms: ['page', 'pageSize', 'cursor', ...filters], create_room: [...settings, ...compatibility], join_room: ['roomId', 'password', 'role', 'invitationToken'],
   ready: ['ready'], start_game: [], update_room: settings, kick_player: ['playerId', 'ban'], unban_player: ['playerId'], transfer_host: ['playerId'],
@@ -52,6 +72,7 @@ const fields: Record<ClientMessage['type'], readonly string[]> = {
   party_create: [], party_invite: ['playerId'], party_accept: ['invitationToken'], party_leave: [], friend_request: ['playerId'],
   friend_respond: ['playerId', 'accept'], friend_remove: ['playerId'], list_friends: [], list_games: [], sync_state: [], leave_room: [], delete_room: [], ping: [],
 };
+const fields = CLIENT_FIELDS;
 function text(value: unknown, max: number, min = 1): value is string {
   return typeof value === 'string' && [...value].length >= min && [...value].length <= max && !/[\p{Cc}\p{Cs}]/u.test(value);
 }
@@ -99,5 +120,6 @@ export function parseClient(input: string, maxPageSize: number): ClientMessage {
       if (!text(data.playerId, 128) || Buffer.byteLength(data.playerId as string) > 128) bad(); break;
     case 'update_room': if (Object.keys(data).every(key => key === 'type' || key === 'requestId')) bad(); break;
   }
+  if (data.rules !== undefined) { try { data.rules = readRules(data.rules); } catch { bad(); } }
   return data as ClientMessage;
 }

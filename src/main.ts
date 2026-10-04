@@ -166,6 +166,8 @@ export async function startBeacon(config: Config, dev: DevOptions, overrides: { 
       unban: id => manager.unbanPlayer(id),
       revoke: async (id, before) => { await manager.revokePlayer(id, before); ledger.clearPlayer(id); },
       closeRoom: id => manager.closeRoomById(id),
+      reportMatch: (matchId, state) => manager.reportMatch(matchId, state),
+      reportPlayerResult: (matchId, playerId, result) => manager.reportPlayerResult(matchId, playerId, result),
       maintenance: enabled => {
         store.audit({ at: Date.now(), actor: 'operator', action: 'maintenance', target: String(enabled) });
         setMaintenance(enabled);

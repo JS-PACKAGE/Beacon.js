@@ -1,5 +1,6 @@
 import type { Config } from '../config.js';
 import type { Admission, GameSessionProvider, MatchAllocation, MatchRequest } from '../types.js';
+import { readRules } from '../protocol/index.js';
 import { apiEndpoint, requestJson, type JsonRequestOptions } from '../auth/http.js';
 import { readSecretFile } from '../auth/secrets.js';
 
@@ -34,7 +35,7 @@ export class HttpGameSessions implements GameSessionProvider {
   }
   async create(input: MatchRequest): Promise<MatchAllocation> {
     try {
-      if (!text(input.operationId) || !text(input.roomId) || !text(input.gameId) || !Array.isArray(input.players) || !input.players.length || new Set(input.players.map(p => p.id)).size !== input.players.length || !input.players.every(p => text(p.id) && ['player', 'spectator'].includes(p.role)) || ![input.version, input.mode, input.region].every(v => typeof v === 'string' && Buffer.byteLength(v) <= 64 && !/[\p{Cc}\p{Cs}]/u.test(v))) throw new GameSessionError();
+      if (!text(input.operationId) || !text(input.roomId) || !text(input.gameId) || !Array.isArray(input.players) || !input.players.length || new Set(input.players.map(p => p.id)).size !== input.players.length || !input.players.every(p => text(p.id) && ['player', 'spectator'].includes(p.role)) || ![input.version, input.mode, input.region].every(v => typeof v === 'string' && Buffer.byteLength(v) <= 64 && !/[\p{Cc}\p{Cs}]/u.test(v)) || (input.rules !== undefined && JSON.stringify(readRules(input.rules)) !== JSON.stringify(input.rules))) throw new GameSessionError();
       const data = object(await this.request('/v1/matches', { method: 'POST', headers: { 'Idempotency-Key': input.operationId }, body: input, statuses: [200, 201] }));
       const tickets = object(data.tickets);
       if (!text(data.matchId) || Object.keys(tickets).length !== input.players.length || !input.players.every(p => text(tickets[p.id], 8192))) throw new GameSessionError();
