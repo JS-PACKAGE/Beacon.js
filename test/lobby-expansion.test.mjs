@@ -269,6 +269,22 @@ test('expired invitation is unusable even for its intended recipient', async t =
   await assert.rejects(bob.command({ type: 'join_room', roomId: room.id, invitationToken: invitation.invitationToken }), code('invitation_expired'));
 });
 
+test('owner can delete an empty room they left and then create again', async t => {
+  const f = await fixture(t, { lobby: { maxRoomsPerPlayer: 1 } });
+  const alice = await f.connect('alice'); const bob = await f.connect('bob');
+  const room = await create(alice); await alice.command({ type: 'leave_room' });
+  await assert.rejects(create(alice), code('rate_limited'));
+  const owned = (await alice.command({ type: 'list_owned_rooms' }))[0];
+  assert.equal(owned.rooms[0].id, room.id);
+  await assert.rejects(bob.command({ type: 'delete_room', roomId: room.id }), code('forbidden'));
+  await bob.command({ type: 'join_room', roomId: room.id });
+  await assert.rejects(alice.command({ type: 'delete_room', roomId: room.id }), code('invalid_state'));
+  await bob.command({ type: 'leave_room' });
+  const closed = await alice.command({ type: 'delete_room', roomId: room.id });
+  assert.equal(closed.find(message => message.type === 'room_closed').reason, 'deleted');
+  assert.equal((await create(alice)).id === room.id, false);
+});
+
 test('room rules reach the match request and a player result stays private', async t => {
   const f = await fixture(t);
   const alice = await f.connect('alice'); const bob = await f.connect('bob');

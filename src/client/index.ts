@@ -46,7 +46,7 @@ export class BeaconError extends Error {
 }
 type Listener = (value: unknown) => void;
 type Pending = {
-  wire: string; command: string; retry: boolean; messages: BeaconMessage[]; bytes: number;
+  wire: string; command: string; retry: boolean; clearsRoom: boolean; messages: BeaconMessage[]; bytes: number;
   resynced?: boolean;
   resolve: (result: BeaconResult) => void; reject: (error: BeaconError) => void;
   timer: NodeJS.Timeout;
@@ -192,7 +192,7 @@ export class BeaconClient {
     if (new TextEncoder().encode(wire).byteLength > 4096) return Promise.reject(new BeaconError('request_too_large', requestId));
     return new Promise<BeaconResult>((resolve, reject) => {
       const timer = setTimeout(() => { this.pending.delete(requestId); reject(new BeaconError('timeout', requestId)); }, timeout);
-      this.pending.set(requestId, { wire, command: message.type, retry: options.retryOnReconnect === true, messages: [], bytes: 0, resolve, reject, timer });
+      this.pending.set(requestId, { wire, command: message.type, retry: options.retryOnReconnect === true, clearsRoom: message.type === 'leave_room' || message.type === 'switch_game' || message.type === 'select_game' || (message.type === 'delete_room' && message.roomId === undefined), messages: [], bytes: 0, resolve, reject, timer });
       try { this.socket!.send(wire); } catch { this.finish(requestId, new BeaconError('disconnected', requestId)); }
     });
   }
@@ -203,7 +203,7 @@ export class BeaconClient {
   private finish(requestId: string, error?: BeaconError): void {
     const entry = this.pending.get(requestId); if (!entry) return;
     clearTimeout(entry.timer); this.pending.delete(requestId);
-    if (!error && !entry.resynced && ['leave_room', 'delete_room', 'switch_game', 'select_game'].includes(entry.command)) {
+    if (!error && !entry.resynced && entry.clearsRoom) {
       this.current = { ...this.current, room: null }; this.emit('state', this.state);
     }
     if (error) entry.reject(error); else entry.resolve({ requestId, messages: entry.messages });
@@ -324,7 +324,12 @@ export class BeaconClient {
       this.current = { ...this.current, lobby: { ...this.current.lobby, rooms, lobbyRevision: message.lobbyRevision, revision: message.lobbyRevision } };
     }
     if (['room_joined', 'room_state', 'room_update', 'room_members'].includes(message.type)) this.current = { ...this.current, room: message };
-    if (message.type === 'room_closed' || message.type === 'room_left') this.current = { ...this.current, room: null };
+    if (message.type === 'room_closed' || message.type === 'room_left') {
+      const closedId = typeof message.roomId === 'string' ? message.roomId : undefined;
+      const current = this.current.room;
+      const currentId = current && typeof current.roomId === 'string' ? current.roomId : current && record(current.room) && typeof current.room.id === 'string' ? current.room.id : undefined;
+      if (!closedId || !currentId || closedId === currentId) this.current = { ...this.current, room: null };
+    }
     this.emit('state', this.state);
   }
   private clearAssemblies(): void { for (const item of this.assemblies.values()) clearTimeout(item.timer); this.assemblies.clear(); }
@@ -377,8 +382,9 @@ export class BeaconClient {
   createRoom(input: BeaconRoomInput): Promise<BeaconResult> { return this.request({ ...input, type: 'create_room' }); }
   joinRoom(roomId: string, options: { password?: string; role?: 'player' | 'spectator'; invitationToken?: string } = {}): Promise<BeaconResult> { return this.request({ type: 'join_room', roomId, ...options }); }
   leaveRoom(): Promise<BeaconResult> { return this.request({ type: 'leave_room' }); }
-  deleteRoom(): Promise<BeaconResult> { return this.request({ type: 'delete_room' }); }
+  deleteRoom(roomId?: string): Promise<BeaconResult> { return this.request(roomId === undefined ? { type: 'delete_room' } : { type: 'delete_room', roomId }); }
   setReady(ready: boolean): Promise<BeaconResult> { return this.request({ type: 'ready', ready }); }
   startGame(): Promise<BeaconResult> { return this.request({ type: 'start_game' }); }
   ping(): Promise<BeaconResult> { return this.request({ type: 'ping' }); }
+  listOwnedRooms(): Promise<BeaconResult> { return this.request({ type: 'list_owned_rooms' }); }
 }

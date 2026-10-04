@@ -254,7 +254,7 @@ export class RoomManager {
     if (payload) fragments.push(payload);
     fragments.forEach((payload, chunkIndex) => send({ ...base, chunkIndex, chunkCount: fragments.length, payload }));
   }
-  private sendMembers(peer: Peer, base: Record<string, unknown>, members: Record<string, unknown>[], direct = true, field: 'members' | 'friends' | 'games' | 'partyMembers' = 'members'): void {
+  private sendMembers(peer: Peer, base: Record<string, unknown>, members: Record<string, unknown>[], direct = true, field: 'members' | 'friends' | 'games' | 'partyMembers' | 'rooms' = 'members'): void {
     const send = (message: Record<string, unknown>) => this.sendPacket(peer, message, direct);
     const limit = this.config.limits.outboundBytes - (direct && peer.reply ? 160 : 0);
     const metadata = { ...base, snapshotId: randomUUID() };
@@ -389,11 +389,13 @@ export class RoomManager {
     if (room.matchId) this.cancelMatch(room.matchId);
     else if (room.matchRequest && !room.operation && !this.recovering.has(room.id)) this.cancelPending(room.matchRequest);
     delete room.operation;
+    let replied = false;
     for (const session of room.players.values()) {
       delete session.roomId; session.ready = false;
       const message = { type: 'room_closed', roomId: room.id, reason };
-      if (requester?.id === session.peer.id) reply(requester, message); else if (this.connected(session)) session.peer.send(message);
+      if (requester?.id === session.peer.id) { reply(requester, message); replied = true; } else if (this.connected(session)) session.peer.send(message);
     }
+    if (requester && !replied && !requester.closed) reply(requester, { type: 'room_closed', roomId: room.id, reason });
     room.reservations.clear(); this.revokeInvites(room.id); this.broadcastLobby(room, 'remove');
   }
   private revokeInvites(roomId: string): void {
@@ -533,8 +535,11 @@ export class RoomManager {
         this.leave(session); this.cancelQueue(session.player.id); session.gameId = game.gameId; session.compatibility = compatibility; this.snapshot(session, game); this.presence(session.player.id);
       }); return;
     }
-    if (message.type === 'list_blocks' || message.type === 'block_player' || message.type === 'unblock_player' || message.type.startsWith('friend_') || message.type === 'list_friends' || message.type.startsWith('party_') || message.type === 'queue_leave') {
+    if (message.type === 'list_owned_rooms' || message.type === 'list_blocks' || message.type === 'block_player' || message.type === 'unblock_player' || message.type.startsWith('friend_') || message.type === 'list_friends' || message.type.startsWith('party_') || message.type === 'queue_leave') {
       await this.serialized(() => { this.requireSession(peer); this.socialCommand(session, message); }); return;
+    }
+    if (message.type === 'delete_room' && message.roomId && message.roomId !== session.roomId) {
+      await this.serialized(() => { this.requireSession(peer); this.deleteOwnedEmpty(session, message.roomId!); }); return;
     }
     if (message.type === 'start_game') { await this.start(peer); return; }
     const gameId = this.requireGame(session);
@@ -648,6 +653,7 @@ export class RoomManager {
   private socialCommand(session: Session & { player: Player }, message: Exclude<ClientMessage, { type: 'auth' }>): void {
     const id = session.player.id;
     if (message.type === 'list_friends') { this.sendFriends(session); return; }
+    if (message.type === 'list_owned_rooms') { this.sendMembers(session.peer, { type: 'owned_rooms', revision: this.lobbyRevision }, [...this.rooms.values()].filter(room => room.ownerId === id).map(room => this.summary(room)), true, 'rooms'); return; }
     if (message.type === 'list_blocks') { reply(session.peer, { type: 'blocks', playerIds: [...this.blocks].flatMap(value => { const pair = JSON.parse(value) as [string, string]; return pair[0] === id ? [pair[1]] : []; }).slice(0, 100) }); return; }
     if (message.type === 'block_player' || message.type === 'unblock_player') {
       if (message.playerId === id) throw new ProtocolError('bad_request');
@@ -764,6 +770,14 @@ export class RoomManager {
       if (record.playerId && record.revokedBefore !== undefined) this.adminRecord(record.playerId, { revokedBefore: Math.max(record.revokedBefore, this.moderation.get(record.playerId)?.revokedBefore ?? 0) }, 'oauth_revoke');
       for (const session of [...this.players.values()]) { const player = session.player!; if ((record.tokenId && player.tokenId === record.tokenId) || (record.playerId === player.id && (record.revokedBefore === undefined || player.issuedAt === undefined || player.issuedAt <= record.revokedBefore))) this.expel(player.id, 'token_revoked'); }
     } });
+  }
+  private deleteOwnedEmpty(session: Session & { player: Player }, roomId: string): void {
+    const room = this.rooms.get(roomId);
+    if (!room) throw new ProtocolError('room_not_found');
+    if (room.ownerId !== session.player.id) throw new ProtocolError('forbidden');
+    if ([...room.players.keys(), ...room.held.keys()].some(id => id !== session.player.id) || room.reservations.size) throw new ProtocolError('invalid_state');
+    room.held.delete(session.player.id); room.pendingResults.delete(session.player.id);
+    this.closeRoom(room, 'deleted', session.peer);
   }
   private releaseHeld(room: Room, playerId: string): void {
     const seat = room.held.get(playerId); if (!seat) return;
