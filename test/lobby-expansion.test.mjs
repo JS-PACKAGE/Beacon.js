@@ -286,3 +286,35 @@ test('room rules reach the match request and a player result stays private', asy
   assert.equal(f.store.load()[0].state, 'open');
   await f.manager.reportMatch(matchId, 'ended');
 });
+
+test('blocks stop invites, friend requests and matchmaking pairs; seats and parties survive restart', async t => {
+  const f = await fixture(t);
+  const alice = await f.connect('alice'); const bob = await f.connect('bob'); const carol = await f.connect('carol');
+  await alice.command({ type: 'block_player', playerId: 'bob' });
+  await assert.rejects(bob.command({ type: 'friend_request', playerId: 'alice' }), code('forbidden'));
+  await assert.rejects(alice.command({ type: 'friend_request', playerId: 'bob' }), code('forbidden'));
+  const room = await create(alice);
+  await assert.rejects(alice.command({ type: 'invite_player', playerId: 'bob' }), code('forbidden'));
+  await alice.command({ type: 'party_create' });
+  await assert.rejects(alice.command({ type: 'party_invite', playerId: 'bob' }), code('forbidden'));
+  await alice.command({ type: 'party_leave' });
+  await alice.command({ type: 'leave_room' });
+  await alice.command({ type: 'queue_join', minPlayers: 2, maxPlayers: 2 });
+  await bob.command({ type: 'queue_join', minPlayers: 2, maxPlayers: 2 });
+  assert.equal(f.manager.stats().queuedPlayers, 2);
+  assert.equal(f.store.load().some(item => item.name === 'Matchmaking'), false);
+  await alice.command({ type: 'queue_leave' }); await bob.command({ type: 'queue_leave' });
+  await f.restart();
+  assert.equal(f.store.listParties().length, 0);
+  assert.equal(f.store.listBlocks().length, 1);
+  const restored = await f.connect('alice', {}, false);
+  assert.equal(restored.roomId, undefined);
+  assert.deepEqual((await restored.command({ type: 'list_blocks' }))[0].playerIds, ['bob']);
+  await restored.command({ type: 'unblock_player', playerId: 'bob' });
+  await restored.command({ type: 'party_create' });
+  await f.restart();
+  const again = await f.connect('alice', {}, false);
+  const party = await again.command({ type: 'sync_state' });
+  assert.equal(party.find(message => message.type === 'party_state').party.leaderId, 'alice');
+  void room;
+});

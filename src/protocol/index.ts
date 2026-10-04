@@ -53,12 +53,12 @@ type Command =
   | { type: 'ready'; ready: boolean }
   | ({ type: 'update_room' } & RoomSettings)
   | { type: 'kick_player'; playerId: string; ban?: boolean }
-  | { type: 'unban_player' | 'transfer_host' | 'invite_player' | 'party_invite' | 'friend_request' | 'friend_remove'; playerId: string }
+  | { type: 'unban_player' | 'transfer_host' | 'invite_player' | 'party_invite' | 'friend_request' | 'friend_remove' | 'block_player' | 'unblock_player'; playerId: string }
   | { type: 'party_accept'; invitationToken: string }
   | { type: 'friend_respond'; playerId: string; accept: boolean }
   | ({ type: 'quick_join'; password?: string } & RoomFilters)
   | ({ type: 'queue_join'; minPlayers?: number; maxPlayers?: number } & Compatibility)
-  | { type: 'leave_room' | 'delete_room' | 'ping' | 'start_game' | 'sync_state' | 'queue_leave' | 'party_create' | 'party_leave' | 'list_friends' | 'list_games' };
+  | { type: 'leave_room' | 'delete_room' | 'ping' | 'start_game' | 'sync_state' | 'queue_leave' | 'party_create' | 'party_leave' | 'list_friends' | 'list_games' | 'list_blocks' };
 export type ClientMessage = Command & { requestId?: string };
 
 const compatibility = ['version', 'mode', 'region'];
@@ -71,6 +71,7 @@ export const CLIENT_FIELDS: Record<ClientMessage['type'], readonly string[]> = {
   invite_player: ['playerId'], quick_join: [...filters, 'password'], queue_join: ['minPlayers', 'maxPlayers', ...compatibility], queue_leave: [],
   party_create: [], party_invite: ['playerId'], party_accept: ['invitationToken'], party_leave: [], friend_request: ['playerId'],
   friend_respond: ['playerId', 'accept'], friend_remove: ['playerId'], list_friends: [], list_games: [], sync_state: [], leave_room: [], delete_room: [], ping: [],
+  block_player: ['playerId'], unblock_player: ['playerId'], list_blocks: [],
 };
 const fields = CLIENT_FIELDS;
 function text(value: unknown, max: number, min = 1): value is string {
@@ -116,7 +117,7 @@ export function parseClient(input: string, maxPageSize: number): ClientMessage {
     case 'ready': if (typeof data.ready !== 'boolean') bad(); break;
     case 'friend_respond': if (typeof data.accept !== 'boolean' || !text(data.playerId, 128) || Buffer.byteLength(data.playerId as string) > 128) bad(); break;
     case 'party_accept': if (!identifier(data.invitationToken)) bad(); break;
-    case 'kick_player': case 'unban_player': case 'transfer_host': case 'invite_player': case 'party_invite': case 'friend_request': case 'friend_remove':
+    case 'kick_player': case 'unban_player': case 'transfer_host': case 'invite_player': case 'party_invite': case 'friend_request': case 'friend_remove': case 'block_player': case 'unblock_player':
       if (!text(data.playerId, 128) || Buffer.byteLength(data.playerId as string) > 128) bad(); break;
     case 'update_room': if (Object.keys(data).every(key => key === 'type' || key === 'requestId')) bad(); break;
   }
