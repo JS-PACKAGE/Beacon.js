@@ -1,374 +1,315 @@
-# Beacon.js 遊戲大廳系統 企劃書 v2.0
+# Beacon.js 遊戲大廳系統 企劃書 v3.0
 
-一句話：一個以 **wss://（WebSocket over TLS）** 為通訊基礎的遊戲大廳系統（**Beacon.js**），玩家經 OAuth 驗證後，在進入大廳前先選定「遊戲」，再依遊戲尋找房間；房間可設密碼、有同時連線人數上限（上限依後端遊戲伺服器 API 設定）。
+定案範圍：以 **WSS + OAuth** 提供遊戲分區大廳；大廳負責房間、社交、組隊、配對確認與遊戲場次交接，遊戲後端負責遊戲邏輯、技能與實測延遲。本次將前一版所有擴充建議納入，HA 採 **跨主機 gateway + etcd quorum + 單一 elected authority**，不是共享 SQLite 檔案。
 
-### 基本資料
+本文件是完整現行企劃，不以舊章節與附錄互相覆蓋。取代 v2 的即時配房、記憶體佇列、席位暫存結果與根套件 SDK 匯出；桌面原始企劃檔未修改。真實外部整合、實體跨主機部署與發布仍需另取得端點、基礎設施與授權。
+
+## 〇、基本資料、目標與邊界
 
 | 欄位 | 內容 |
 |---|---|
-| 套件名稱 | **Beacon.js** |
-| 程式語言 | **TypeScript** |
-| 執行環境 | **Node.js v26**（本機實測 `node -v` = v26.3.1，見假設 1） |
-| 通訊協定 | **wss://**（RFC 6455 over TLS；生產環境不得降級為 ws） |
-| 遠端倉庫 | https://github.com/JS-PACKAGE/Beacon.js.git（main） |
-| 介紹網址 | https://beacon.js-package.xyz（CNAME 已就位，目前回 404，見假設 5） |
-| 部署平台 | **現階段：Mac mini M1**（Apple Silicon，暫定）；**穩定對外上線後另覓機房（亞洲／美西，另案裁示，不鎖定雲端）**——見八與假設 6 |
-| 本地監聽 | **port `34568`**（本機監聽埠，配置於 `config.yaml`，見 R11） |
-| 對外網域 | **`lobby.ysgs.app`** —— **僅接受 `wss://` 連線**，不提供一般網頁；**配置於 `config.yaml`**（見 R11、六.1、八） |
-| 授權 | **Apache-2.0**（`LICENSE` 已推送） |
-| 外部系統 A | OAuth 驗證系統 —— **另案製作**，以另外的 API 介接（契約見四） |
-| 外部系統 B | 遊戲伺服器 —— **另案製作**，以另外的 API 串接（契約見四） |
-| 倉庫前置檔案 | `CNAME`、`LICENSE`、`.nojekyll` **三檔已在 main**（2026-10-03 經 GitHub API 驗證，見 Gate 0） |
-
-結構：〇 概述 → 一 需求總表 → 二 系統架構 → 三 通訊協定 → 四 外部 API 介接 → 五 資料模型 → 六 安全性架構 → 七 必要文件規格 → 八 倉庫與部署 → 九 風險 → 十 里程碑與 Gate → 十一 已知假設。全程以「執行 Agent」泛指實作方，不綁定特定工具。
-
----
-
-## 〇、專案概述
+| 服務 | Beacon.js，根套件 `@js-package/beacon` 3.0.0，private |
+| SDK | `@js-package/beacon-client` 3.0.0，獨立可打包、無 runtime dependencies，未發布 npm |
+| 語言／執行 | TypeScript ESM／strict；服務 Node.js ≥26，本機證據 Node 26.7.0；SDK browser／Node ≥22 |
+| 對外協定 | protocol v3，`wss://lobby.ysgs.app`；一般 HTTP(S) 不提供網頁 |
+| 本機監聽 | public upstream 預設 `127.0.0.1:34568`；管理預設 34569；私有 HA control 預設 34570；均可配置、均只綁 loopback |
+| 設定 | 根目錄 `config.yaml` 唯一部署真值；CLI `--config PATH` 明確選擇另一份完整設定 |
+| 倉庫／介紹頁 | https://github.com/JS-PACKAGE/Beacon.js.git；GitHub Pages 介紹域名 `beacon.js-package.xyz`，不承載 WSS |
+| 部署 | 單機 Mac mini M1／launchd 仍可使用；HA 可跨主機；Linux systemd 工具已備但本機未部署驗證 |
+| 授權 | Apache-2.0；CNAME／LICENSE／.nojekyll 的先行推送要求為已完成的歷史 gate |
 
 ### 目標
-- 一個 Node.js v26 服務（TypeScript 撰寫），對外提供 **wss://** 大廳連線。
-- 玩家連線後經 **OAuth 驗證**（由另案驗證系統的 API 完成，本系統只做介接與憑證驗證）。
-- 玩家**進入大廳前先選定所屬「遊戲」**，大廳內容（房間列表）以遊戲為範圍。
-- 房間可**加密碼**；房間有**同時連線人數上限**，上限由後端遊戲伺服器 API 設定。
-- **房間資料持久化**：服務重啟後房間仍在（名稱、密碼雜湊、上限、所屬遊戲、建立時間）——連線不持久；寬限內席位可恢復，逾時才清空（R12、三·邊界規則 2）。
-- 倉庫齊備必要文件：`README.md`、`AGENTS.md`、`CLAUDE.md`、`PLAN.md`。
+
+- 玩家限時完成 OAuth 驗證，選遊戲後才能看房間；房間密碼與容量受嚴格驗證。
+- 開局、補位、觀戰與重連只透過遊戲場次 provider 取得該玩家自己的 ticket。
+- 房間、社交、配對、私人結果與 moderation 可持久恢復，成功 ACK 必須晚於持久提交。
+- 所有十二項本次擴充均有真實實作；缺少必要後端明確拒絕，不用 stub、假 ticket、假 profile 或假完成。
+- 單機與 HA 使用相同 RoomManager、協定與 SDK；HA 不允許多個 writer 各自接受不同房間狀態。
 
 ### 範圍外
-- 不做遊戲本體、遊戲邏輯、遊戲狀態同步（屬遊戲伺服器另案）。
-- 不做帳號密碼登入、註冊、密碼重設——驗證系統另案，本系統只介接其 API。
-- 不做前端大廳 Web UI（介面交付物是 wss 協定與文件；介紹頁屬八的靜態頁）。
-- 不主動發布 npm 套件 registry（未要求；倉庫本身即交付物）。
 
-### 硬性要求
-| 編號 | 要求 |
-|---|---|
-| R1 | 程式語言 TypeScript；執行環境 Node.js v26 |
-| R2 | 對外通訊為 **wss://**（TLS）；生產設定下明文 ws 必須被拒絕，僅允許開發旗標啟用 |
-| R3 | 登入驗證採 **OAuth**，驗證系統另案另 API；本系統不得自行實作帳號密碼儲存或驗證邏輯 |
-| R4 | 玩家**進入大廳前即已確定所屬遊戲**：未 `select_game` 不得取得任何房間資訊 |
-| R5 | 玩家依「遊戲」尋找／列出房間，房間列表僅顯示同遊戲者 |
-| R6 | 房間可被加密碼；加入時驗證密碼，密碼錯誤不得加入 |
-| R7 | 房間有同時連線人數上限，上限值依後端遊戲伺服器 API 回傳設定；滿員不可再加入 |
-| R8 | 必要文件齊備：`README.md`（用途）、`AGENTS.md`（撰寫方式＋安全性架構）、`CLAUDE.md`（引用 `AGENTS.md`）、`PLAN.md`（匯入本企劃書全文之定案稿） |
-| R9 | `LICENSE` = Apache 2.0；`CNAME` 內容 = `beacon.js-package.xyz`；`.nojekyll` 存在 |
-| R10 | 實作順序：**先推送 `CNAME`、`LICENSE`、`.nojekyll` 三檔，之後才開始寫程式**（三檔已在 main，見 Gate 0） |
-| R11 | **部署設定一律配置於專案根目錄 `config.yaml`，程式不得寫死**——至少含：本地監聽埠 **`34568`**、對外網域 `lobby.ysgs.app`、TLS／代理模式、驗證系統與遊戲伺服器 API 端點、各項配額預設值；改設定不需改碼 |
-| R12 | **房間資料持久化**（使用者裁示 2026-10-03，v2 修訂寬限席位）：房間存 SQLite，**服務重啟後房間仍存在**；連線與配對佇列不持久。寬限未過的席位從 metadata 恢復，仍須重新驗證；已過期則成員清空、`hostId` 保留，**首位加入者成為新房主**（見三·邊界規則 5、五）；持久操作**落庫提交成功才回成功** |
-
----
+- 帳號註冊／密碼登入／重設、OAuth token 發行、遊戲本體與狀態同步。
+- 排名／經濟資料庫、客戶端自報技能／權威延遲、全域／語音聊天、前端大廳 UI。
+- 未經明確授權的 commit／push、npm publish、release、Pages 發布、Cloudflare／production 操作。
+- 自動 SSH 部署；外部主機作業由使用者依工具與文件操作並回報安全證據。
 
 ## 一、需求總表
 
-| 面向 | 需求 |
+| 編號 | 現行要求 |
 |---|---|
-| 連線 | wss:// 服務；連線後限時內完成驗證，否則斷線；心跳（ping/pong）清理死連線 |
-| 驗證 | OAuth：客戶端帶 token → 本系統呼叫驗證系統 API 換取玩家身分 → 建立會話 |
-| 遊戲選擇 | 遊戲清單來自遊戲伺服器 API；玩家於大廳前選定一個遊戲，會話內可切換（切換＝離開當前房間） |
-| 房間 | 建立（可設密碼、可設上限但不得超過遊戲上限）、列出、加入（驗證密碼、驗證滿員）、離開、解散（房主）、房間生命週期（房主解散；空房依 `room.emptyTtlSec` 清除） |
-| 持久化 | 房間、寬限席位、好友、隊伍、邀請與玩家封鎖存 **SQLite**（`data/beacon.db`，0600＋WAL）——連線與配對佇列仍在記憶體（R12） |
-| 即時同步 | 房間人數、成員變動即時推播給房間內所有連線；大廳房間列表變動推播給同遊戲大廳內所有連線 |
-| 列表與訊息大小 | `list_rooms` **分頁**（預設 50/頁、上限 200）；**入站單則 4 KB、出站單則 64 KB**——超過者分頁／拆包，絕不截斷（三） |
-| 人數上限 | 每遊戲預設上限來自遊戲伺服器 API；建房時可指定更低上限；滿員加入一律拒絕（含競態，見六.5） |
-| 安全性 | wss only、驗證前置、密碼雜湊儲存、頻率限制、輸入驗證、憑證不入日誌——完整規則見六，並寫入 `AGENTS.md` |
-| 專案文件 | `README.md`、`AGENTS.md`、`CLAUDE.md`（引用 AGENTS.md）、`PLAN.md`（本企劃書定案稿）——規格見七，驗收見 Gate E |
-| 設定 | **根目錄 `config.yaml` 為唯一設定真值來源（R11）**：本地監聽 `127.0.0.1:34568`、對外網域 `lobby.ysgs.app`、TLS／代理模式、外部 API 端點、配額預設值——程式不寫死 |
-| 部署 | **現階段 Mac mini M1 執行 wss 服務（本地監聽 34568）**，對外 **`wss://lobby.ysgs.app`（僅接受 WSS，不提供網頁）**；穩定上線後另覓機房（另案）；GitHub Pages 僅服務介紹頁（`beacon.js-package.xyz`，`CNAME`＋`.nojekyll` 已就位）——見八 |
+| R1 | TypeScript ESM strict、exactOptionalPropertyTypes／noUncheckedIndexedAccess；禁止以 any 敷衍型別；服務 Node ≥26 |
+| R2 | 外網只 WSS；app upstream 只 loopback；開發明文必須明確旗標，不能用於部署 |
+| R3 | OAuth 只經 AuthProvider；驗證不可達 fail-closed，不發匿名身分 |
+| R4 | 未選遊戲不得取得房間資訊 |
+| R5 | 房間列表按遊戲／版本／模式／區域隔離 |
+| R6 | 每房隨機 salt 的 scrypt 密碼，常數時間比對，列表只顯示 hasPassword |
+| R7 | 遊戲 API 決定人數上限；密碼／admission 外部工作期間預留名額，競態不得超員 |
+| R8 | README、AGENTS、CLAUDE（引用 AGENTS）、完整現行 PLAN 齊備且與契約一致 |
+| R9 | Apache-2.0 LICENSE、CNAME=beacon.js-package.xyz、.nojekyll 保留 |
+| R10 | CNAME／LICENSE／.nojekyll 必須先推送再開發；此歷史要求已完成，本次不重新發布 |
+| R11 | config.yaml 唯一部署真值，完整 flow-style JSON + 引號外 # 註解；不支援 block YAML 或環境變數覆蓋 |
+| R12 | SQLite 持久房間／寬限席，提交後成功；損毀保留原檔並拒絕啟動；HA 本機 DB 是物化，不是全群組權威 |
+| R13 | open → starting → in_game → open；全員 ready 才開局；未知配置結果以原 operationId reconcile，不虛構成功 |
+| R14 | ownerId 與 hostId 分離；重連必須重新驗證；寬限席占容量並可跨重啟恢復 |
+| R15 | protocol v3 requestId、terminal result、revision、穩定房間游標、snapshot 分包；v2 乾淨切換、不提供 shim |
+| R16 | 房主改設定／踢人／房間封鎖／移交／受邀制；owner 可管理自己的無其他成員空房 |
+| R17 | 同身分 refresh_auth、必要撤銷 fail-closed、持久管理封禁、擁有者房間配額、跨連線密碼猜測限制 |
+| R18 | 搜尋／排序／只可加入／quick_join／相容性；不洩露不可見房間 |
+| R19 | 雙方同意好友、好友限定在線狀態、完整隊伍、不拆隊配對 |
+| R20 | 私有 bearer 管理 HTTP、持久稽核、備份／隔離還原、遮蔽輪替日誌、告警、維護／排空與容量 CLI |
+| R21 | 封鎖原子關閉既有好友關係、待處理邀請與不相容隊伍／佇列／提案；解除不恢復舊同意 |
+| R22 | matchId／原始 roster／本人私人結果與 ACK 獨立持久化；刪房／離房／重啟後晚回報與去重仍成立 |
+| R23 | incoming／outgoing 邀請收件匣、登入同步、收件人拒絕／寄件人撤回及持久終態 |
+| R24 | 隊長移交／踢人／解散、整隊密碼／admission 預留與原子進房；失敗不可半隊落庫 |
+| R25 | 配對先提案，接受／拒絕／期限；全員接受才建房，其餘合格隊伍回列且保留原等待年齡 |
+| R26 | 完整 typed SDK events／results／social state、AbortSignal、雙向機器 JSON Schema、runtime 不接受假型別 |
+| R27 | 遊戲 capability／typed rule descriptors 驗證 create／update／start／admit；provider 是最終場次權威 |
+| R28 | 管理房間／場次列表與詳情、queue／proposal／dependency／HA 診斷、安全 provider reconcile |
+| R29 | room／party 聊天、私密歷史、封鎖過濾、限流、禁言、檢舉／私有管理審查、保留與容量界線 |
+| R30 | 可信技能與後端實測 RTT、完整隊伍／角色／隊伍技能平衡、有限等待放寬、可控搜尋預算；無可信後端拒絕 advanced |
+| R31 | 獨立 SDK exports／d.ts／browser／Node／LICENSE／schema／tarball，隔離 consumer 安裝驗證；不發布 |
+| R32 | 跨主機 HA：etcd quorum 選舉／lease／epoch fencing、gateway 路由、changeset journal／checkpoint、故障接管與跨重啟有界 request outcome 去重 |
 
----
+## 二、系統架構與工程約束
 
-## 二、系統架構
-
-```
-[遊戲客戶端] ⇄ wss:// [Beacon.js 大廳服務 (Node.js 26 + TypeScript)]
-                        ├─ src/net/        TLS + WebSocket 接受連線、幀讀寫、心跳、連線生命週期
-                        ├─ src/protocol/   訊息型別定義、schema 驗證、錯誤碼（唯一真值來源）
-                        ├─ src/auth/       AuthProvider 介面（驗證系統 API / JWT-JWKS / Mock 三實作）
-                        ├─ src/games/      遊戲註冊表（遊戲伺服器 API 快取，TTL + 手動刷新）
-                        ├─ src/lobby/      大廳與房間狀態機：選遊戲、房間表、加入/離開、上限佇列
-                        ├─ src/security/   頻率限制、密碼雜湊 (scrypt)、來源檢查、連線配額
-                        ├─ src/store/      SQLite 持久化（node:sqlite → data/beacon.db；房間表、schema 版本）
-                        ├─ src/log/        結構化日誌（憑證與 token 遮蔽）
-                        └─ config.yaml    部署設定（唯一設定真值，R11）：本地監聽 127.0.0.1:34568、
-                                          對外網域 lobby.ysgs.app、TLS/代理模式、外部 API 端點、配額
-外部：驗證系統 API（另案） 、遊戲伺服器 API（另案）——契約見四，皆以介面抽象 + Mock 實作先行開發
-```
-
-- **語言與建置**：全專案 TypeScript；`tsc` 編譯 `src/` → `dist/`，Node 26 執行 `dist/`；型別檢查 `tsc --noEmit`；測試用 Node 內建 `node:test`（免測試框架相依）。
-- **依賴策略（已定案，使用者裁示 2026-10-03）**：**WebSocket 伺服器端採 `ws` 套件**（成熟、無原生相依、資安經實戰；自製幀層風險高於收益），為執行期**唯一**第三方相依——CI 跑 `npm audit --omit=dev`。其餘一律 Node 內建：`node:https`（TLS／代理側）、`node:crypto`（scrypt、隨機數）、`node:test`、**`node:sqlite`（房間持久化，R12；Node 26 API 狀態於實作期驗證，見假設 8）**。自製 RFC 6455 **不採用**。
-- **狀態儲存**：**連線／會話在記憶體，房間資料持久化到 SQLite**（`node:sqlite` 內建 → `data/beacon.db`，0600＋WAL；見五與假設 8）；單節點部署。
-- **部署形態**：
-  - **現階段（暫定）**：wss 服務跑於 **使用者的 Mac mini M1**（Apple Silicon、macOS、Node 26），**本地監聽 `127.0.0.1:34568`（port 配置於 `config.yaml`）**，**`lobby.ysgs.app` 經 Cloudflare Tunnel（已定案）轉送至該埠，TLS 終結於 Cloudflare**。
-  - **後續（不設時機）**：**穩定對外上線後另覓機房（亞洲／美西，另案裁示，GCP 已取消、不鎖定特定雲端）**——屆時僅換主機與啟動方式（systemd），程式與 `config.yaml` 不動。
-  - **`lobby.ysgs.app` 僅接受 WebSocket 升階（`wss://`），一般 HTTP(S) 請求一律拒絕**（見六.1）。介紹頁屬 GitHub Pages（`beacon.js-package.xyz`），與本網域無關。
-
----
-
-## 三、通訊協定（wss://，JSON 訊息）
-
-所有訊息為單一 JSON 物件 `{ "type": string, ... }`。**大小限制分入站與出站**：**入站（Client→Server）單則 4 KB**，超限即斷線；**出站（Server→Client）單則 64 KB**，超過者一律分頁（列表，見 `list_rooms`）或拆包傳輸，**絕不靜默截斷**。未知 `type` 回 `error{code:"unknown_type"}`（不斷線），schema 驗證失敗回 `error{code:"bad_request"}`。
-
-### 連線生命週期
-1. TCP + TLS + WebSocket 升階（來源檢查，見六.3）。
-2. 伺服器發 `hello{serverVersion, authDeadlineMs}`。
-3. 客戶端須在期限內（預設 10 秒）送 `auth`，否則斷線。
-4. `auth` 成功 → 取得玩家身分 → 才能 `select_game`。
-5. 心跳：伺服器每 30 秒送 ping，60 秒無 pong 斷線。
-
-### Client → Server
-| type | 欄位 | 說明 |
-|---|---|---|
-| `auth` | `token` | OAuth access token；伺服器交驗證系統 API 換身分（四.1） |
-| `select_game` | `gameId` | 進入大廳前必填；`gameId` 不在遊戲註冊表 → `error{game_not_found}` |
-| `list_rooms` | `page?`, `pageSize?` | 取得當前遊戲房間列表**第 `page` 頁**（分頁：預設 `pageSize`=50、上限 200；回 `lobby_state{rooms[], nextPage?, total}`）；首頁可直接以 `lobby_state` 取得，後續變動以 `lobby_update` 增量推播 |
-| `create_room` | `name`, `password?`, `maxPlayers?` | 建立房間並成為房主；`maxPlayers` 不得超過遊戲上限，未填＝遊戲上限 |
-| `join_room` | `roomId`, `password?` | 加入房間；有密碼房需附密碼；滿員回 `room_full` |
-| `leave_room` | — | 離開房間（回大廳；房主離職則移交） |
-| `delete_room` | — | **解散房間（僅房主）**：落庫刪除並推播 `lobby_update{change:"remove"}` |
-| `switch_game` | `gameId` | 離開當前房間並切換遊戲（等同 leave + select） |
-| `ping` | — | 應用層心跳（`pong` 回應） |
-
-### Server → Client
-| type | 欄位 | 說明 |
-|---|---|---|
-| `hello` | `serverVersion`, `authDeadlineMs` | 連線即發 |
-| `auth_ok` | `player{id, displayName}` | 驗證成功 |
-| `auth_fail` | `code` | 驗證失敗（Generic 對外，細節入日誌）；伺服器隨後斷線 |
-| `lobby_state` | `game`, `rooms[]`, `nextPage?`, `total` | 遊戲大廳**單頁**快照（每房間 `{id, name, playerCount, maxPlayers, hasPassword, state}`）——**受 `pageSize` 與出站 64 KB 雙重約束**，兩者取小 |
-| `lobby_update` | `change`, `room` | 房間增／改／刪的增量推播（同遊戲大廳內所有人） |
-| `room_joined` | `room{id, name, playerCount, maxPlayers}`, `members[]` | 加入成功 |
-| `room_state` | `playerCount`, `members[]`, `change``join`/`leave` | 房間內人數與成員變動即時推播 |
-| `room_closed` | `roomId`, `reason``deleted`/`expired` | 房間被解散或空房 TTL 到期——房內成員**自動回到該遊戲大廳**（`select_game` 狀態保留），大廳內所有人另收 `lobby_update{change:"remove"}` |
-| `error` | `code`, `message` | 錯誤碼（唯一真值表放 `src/protocol/`） |
-
-### 錯誤碼（對外）
-`auth_required`、`auth_failed`、`auth_expired`、`game_not_found`、`not_in_lobby`、`room_not_found`、`room_full`、`room_password_required`、`room_password_incorrect`、`already_in_room`、`wrong_game`、`host_only`、`session_replaced`、`storage_error`、`rate_limited`、`bad_request`、`unknown_type`、`server_error`。
-
-### 會話與房間邊界規則（**已選定，實作不得自行猜測**）
-1. **同一玩家多連線＝單會話策略**：同一 `playerId` 再次驗證成功時，**保留最新連線，舊連線以 `error{code:"session_replaced"}` 斷線**——避免雙重佔位與跨連線狀態分裂。
-2. **加入途中斷線**：`join_room` 於「預留名額／驗密碼」階段斷線 → **釋放預留名額、不留下幽靈成員**；加入成功後才斷線 → 席位與準備狀態保留 `lobby.reconnectGraceMs`（0＝立即離房），期間仍占名額，並寫入房間 metadata。恢復**必須重新 `auth`**，不能憑 playerId／roomId 取回；逾時才視同離房並移交房主。保留期內重連不必重驗密碼。
-3. **跨遊戲加入一律拒絕**：房間操作僅限當前 `currentGameId`——`join_room`／`create_room` 目標房間的 `gameId` 與會話不符 → `error{wrong_game}`（須先 `leave_room`＋`switch_game`）；`list_rooms` 只回當前遊戲的房間。
-4. **解散／到期後的成員去向**：`delete_room` 與空房 TTL 到期 → 房內成員收 `room_closed` 並**自動回到該遊戲大廳**（無需重選遊戲），大廳推播 `lobby_update{change:"remove"}`。
-5. **房主與擁有者規則（本企劃書選定）**：
-   - 房內解散與變更設定：僅在線房主可 `delete_room`（可不帶 `roomId`）／變更房間設定，其他人回 `error{host_only}`。
-   - 已離開的空房：擁有者可 `list_owned_rooms`，並以 `delete_room{roomId}` 刪除自己名下、沒有其他成員／保留席／預留名額的房間。非擁有者回 `forbidden`，房內仍有他人回 `invalid_state`。`maxRoomsPerPlayer` 仍計入未刪的空房，直到刪除或空房 TTL。
-   - 房主 `leave_room` 且寬限結束 → 權限**移交房內最早的在線玩家或保留席**（落庫改寫 `hostId`）；無人則回到 `ownerId`。
-   - 空房在無人接回前保留原 `hostId`；**第一位成功加入者成為新房主（落庫改寫）**——是實際移交，非「僅暫代」。
-   - 移交後原房主重新加入＝普通成員，**不恢復房主權限**；僅當 `hostId` 仍為他時才是房主。擁有者刪空房不需要同時是房主。
-
-### 流程範例
-```
-連線 → hello → auth(token) → auth_ok
-      → select_game("g-001") → lobby_state{房間列表}
-      → join_room{roomId, password} → room_joined →（其他玩家）room_state
-      → leave_room → lobby_state
+```text
+遊戲客戶端 → Cloudflare WSS → 本機 gateway
+                                │ 私網 WSS（shared bearer、TLS、來源重驗）
+                                ↓
+                         elected authority
+                         單一 RoomManager
+                          ├ AuthProvider／撤銷
+                          ├ GameProvider／GameSessionProvider／可信 profile
+                          ├ SQLite（本機）
+                          └ etcd worker：lease、原生 changeset、分塊 checkpoint
 ```
 
----
-
-## 四、外部 API 介接（兩套皆另案，先定契約 + Mock）
-
-> 兩個外部系統皆「另外處理 API」——本企劃書先定**本系統需要的介面契約**，實作期以 Mock 落地、API 到位後換實串接，程式碼不得散落對外部的直接呼叫（一律經 `src/auth/`、`src/games/` 的介面）。
-
-### 4.1 驗證系統 API（OAuth，另案）
-本系統需要的最小契約（**待驗證系統定案，見假設 2**）：
-- **路徑 A（JWT 驗證，預設）**：驗證系統公開 JWKS 端點；本系統驗證 JWT 簽章、`exp`、`iss`、`aud` 後取得 `sub`（玩家 ID）與 `name`。本系統不代為發 token。
-- **路徑 B（伺服器交換）**：`POST {AUTH_API}/v1/verify`，Header `Authorization: Bearer <token>` → `200 {playerId, displayName}` / `401`。
-- **AuthProvider 介面**：`verify(token) → Player | AuthError`；實作：`JwksProvider`、`RemoteVerifyProvider`、`MockAuthProvider`（**僅限本地開發與自動化測試**）。驗證失敗一律斷線，不得降級為匿名。
-- **Mock 使用限制**：`auth.mode: mock` **僅限開發與測試**——正式環境啟動時遇 `mode=mock` 即拒絕啟動（六.11）；**Gate E 的部署驗收與整合驗收禁止以 Mock 通過**：真實 OAuth 尚未接通前，只能宣稱「開發驗收＋部署驗收通過」，**整合驗收維持 blocked，不得隱瞞**（Gate E ⑧）。
-- token **僅存於連線記憶體**，不落日誌、不落檔、不回傳給第三方。
-- **撤銷清單（選用；設定後即必要依賴）**：`GET {auth.revocationUrl}`。非 mock **必須**帶 `Authorization: Bearer`，token 來自 0600 的 `auth.revocationTokenFile`，不得寫入設定檔。回 `[{playerId?, tokenId?, revokedBefore?}]`（`playerId` 與 `tokenId` 至少一項；`revokedBefore` 僅能搭配 `playerId`）。拉取失敗拒絕新驗證並中斷現有連線。比對 `revokedBefore` 時缺少簽發時間視為已撤銷，不得用 `authAt` 充當。
-
-### 4.2 遊戲伺服器 API（另案）
-本系統需要的最小契約（**待遊戲伺服器定案，見假設 4**）：
-- `GET {GAME_API}/v1/games` → `[{ gameId, name, maxPlayersPerRoom, enabled }]`
-  - 用途：遊戲清單、每遊戲房間人數上限（R7 的上限來源）。
-- 快取 TTL 60 秒；啟動時若遠端失敗 → 採上次快取或啟動期設定檔，並記 warning；遊戲註冊表不得為空到無法運作（至少可回 `game_not_found`）。
-- **場次（v2，R13；取代「大廳不呼叫對戰端點」）**：`POST {sessionApiUrl}/v1/matches`（`Idempotency-Key`，body 含玩家、相容性與選用 `rules`）→ `{matchId,serverUrl,expiresAt,tickets}`；`POST /v1/matches/:id/admissions`；`GET /v1/matches/:id`；`DELETE /v1/matches/:id`。結束與個人結果由遊戲呼叫 loopback 管理 HTTP `POST /matches/result`、`POST /matches/player-result`，不走公開 WSS。ticket 只給該玩家。未設定 `sessionApiUrl` 時 `start_game` 回 `game_service_unavailable`，不以假資料冒充。
-- 遊戲伺服器 API 的實際格式若與上列不同，**只改 `src/games/` 的 adapter**，不動大廳狀態機。
-
----
-
-## 五、資料模型（房間持久化至 SQLite＋連線狀態在記憶體，單節點）
-
-```
-# ── 記憶體（連線狀態，重啟即失） ──
-Game      { gameId, name, maxPlayersPerRoom, enabled, source: "api"|"cache"|"config" }
-Room      { id, gameId, name, hostId, passwordHash?: string,   // scrypt：salt+hash，永不明文
-            maxPlayers, players: Map<playerId, Connection>, state: "open"|"closed", createdAt }
-Player    { id, displayName, authAt, currentGameId?, currentRoomId? }
-Connection{ socket, playerId?, lastPongAt, msgWindow: RateBucket, ip }
-RateBucket{ tokens, updatedAt }                                // token bucket
-
-# ── SQLite data/beacon.db（持久化，R12） ──
-rooms     id PK, game_id, name, password_hash?, max_players,
-          host_id, state, created_at, updated_at
-schema_migrations version, applied_at
-```
-
-### 持久化規則（R12）
-- **寫入語意＝先落庫、後應答（write-then-ack）**：所有持久操作（建房、解散、房間設定變更、房主移交）在單一序列化佇列中**先提交 SQLite，提交成功才套用記憶體狀態、才回成功訊息**；**落庫失敗 → 回 `error{code:"storage_error"}`，記憶體不得有任何變更**——因此不會發生「建房回成功卻遺失」，也不會發生「刪房回成功、重啟後復活」（刪除失敗即回失敗，房間保持原狀可重試）。
-- **落庫時機**：建房、解散、房間設定變更、房主移交、寬限席位、好友、隊伍、邀請、玩家封鎖與管理員處分。`hostId` 於移交時更新（三·邊界規則 5）。
-- **不落庫**：WebSocket 連線、配對佇列、冪等快取與列表游標。在線成員不另表存放；寬限內席位寫在房間 metadata 的 `seats`。
-- **重啟後重載**：房間、密碼雜湊、擁有者、`hostId`、房間封鎖、好友、隊伍、邀請、玩家封鎖與管理員處分都保留。`seats.expiresAt` 未過期者恢復為保留席，仍須重新驗證才接回；已過期則視同空房，首位加入者成為新房主。配對佇列清空。關機會把未過期席位的 `expiresAt` 延到至少再一個 grace，避免重啟瞬間過期。
-- **備份／還原**：備份用 SQLite backup API（或 `PRAGMA wal_checkpoint` 後複製）；還原＝停止服務 → 換回備份檔 → 啟動。流程寫入 README。
-- 儲存層以 `src/store/` 隔離（預設 `node:sqlite`；若改 `better-sqlite3` 只動此層，見假設 8）。
-- **房間生命週期**：房主離開且寬限結束 → 移交最早的在線玩家或保留席（無人則 `hostId` 回到擁有者）。房內房主可 `delete_room` 解散。擁有者可刪除自己名下的空房（見三·邊界規則 5）。無人且寬限已過的房間依 `room.emptyTtlSec`（預設 1800 秒、0＝永不）清除——重啟後空房重新計時。
-- **上限保證**：加入前檢查 `players.size < maxPlayers`，且密碼驗證期間**預留名額**（見六.5）。
-- **連線不持久化**：玩家連線與配對佇列無法持久——重啟後所有人需重新連線與驗證。寬限內席位可恢復，佇列不行。
-- 單執行緒事件迴圈內的狀態變更以單一 `RoomManager` 序列化（所有 join/leave 走同一佇列），避免競態；**持久操作的落庫亦經此佇列——落庫失敗即回 `storage_error` 且記憶體不變（見下）**。
-
----
-
-## 六、安全性架構（**須完整寫入 `AGENTS.md` 作為撰寫硬規則**）
-
-1. **傳輸（分層定義，兩層各自成立、不得混淆）**：
-   - **外網層（使用者 ↔ Cloudflare）**：**僅 `wss://lobby.ysgs.app`（`config.yaml`）**——443 只放行 WebSocket 升階（`Upgrade: websocket`），一般 HTTP(S) 一律回 403／426，不提供任何網頁。
-   - **本機 upstream 層（Tunnel／代理 ↔ 本程序 `127.0.0.1:34568`）**：本程序**只綁 loopback，且只接受來自 loopback 的連線——非 loopback 來源（不論明文或 TLS）一律拒絕**。此段明文是「TLS 已在 Cloudflare 終結」的設計性安排，**不是安全豁免**：外網強制 wss 與本機僅回環是兩條同時生效的規則。
-   - **開發明文**：任何形式的明文 ws（含綁 `127.0.0.1`）**僅限 `--dev-insecure-ws` 旗標**；非開發模式下綁非 loopback 的明文啟動直接被拒絕。
-   - 若改 `public.tls: direct`（本程序自持憑證、不經隧道），於 `config.yaml` 啟用；本機層仍僅回環。
-2. **驗證前置**：連線 10 秒內未 `auth` 即斷線；`auth_fail` 後斷線；驗證系統不可達 → 拒絕新驗證（fail-closed），不得放行匿名。
-3. **來源與連線配額**：升階請求檢查 `Origin`（白名單，非白名單拒絕，CLI 客戶端可豁免）；每 IP 連線數上限（預設 10）、全服務連線總量上限（預設 5000）、每 IP 新連線頻率限制（預設 5/10 秒）。**來源 IP 判定（防偽造）**：僅當連線來自受信任代理（`config.yaml: server.trustProxy: true` 且 socket remote 為 loopback／設定之代理位址）時，才採 `CF-Connecting-IP` 或 `X-Forwarded-For` 的最右可信值；**其餘一律用 socket remoteAddress——絕不直接信任用戶端可自行偽造的轉送標頭**；`Origin` 檢查在經代理時同理取轉送後實際來源。
-4. **密碼**：房間密碼以 `node:crypto` scrypt（每房隨機 salt）雜湊儲存，常數時間比較（`timingSafeEqual`）；密碼不得出現在日誌、推播、房間列表（列表只回 `hasPassword`）；加入密碼驗證失敗頻率限制（預設 5 次/分鐘/**玩家**，跨連線、斷線不重置，程序重啟不保留，超過回 `rate_limited`）。
-5. **競態與滿員**：`join_room` 流程＝「同步檢查＋預留名額 → 非同步驗密碼 → 確認或釋放」；密碼驗證期間名額已佔，失敗即釋放——兩客戶端同秒加入不得超過 `maxPlayers`。
-6. **輸入驗證**：每訊息 4 KB 上限；JSON 解析失敗計次，單連線 3 次即斷線；所有欄位過 schema（型別、長度、字元集：房名 1–32 字、禁控制字元）；未知欄位拒絕。
-7. **頻率限制**：每連線 token bucket（預設 20 訊息/10 秒），超限回 `rate_limited`，持續超限斷線。
-8. **憑證衛生**：玩家 token／JWT、房間密碼明文**一律不入日誌**（log 模組自動遮蔽 `token`、`password` 欄位）；錯誤對外 generic，堆疊與外部 API 回應體只進伺服器日誌。
-9. **依賴與供應鏈**：依賴最小化（預設僅 `ws`，儲存層 `node:sqlite` 內建）、鎖定 lockfile、CI 跑 `npm audit --omit=dev`；禁止 `eval`/`Function()`、禁止動態 require 使用者輸入。**`data/beacon.db` 權限 0600、與 WAL／-shm 一併保護；資料檔路徑配置於 `config.yaml`**。
-10. **資源防護**：ping/pong 死連線回收、socket `highWaterMark` 與背壓處理（推播佇列過大即踢除該連線）、房間數量上限（預設 1000/遊戲）防止房間表炸裂。
-11. **驗證模式管制（fail-closed）**：`auth.mode: mock` **僅限本地開發與自動化測試**——啟動時若 `mode=mock` 而未帶開發旗標 `--dev-mock-auth`，**拒絕啟動**；正式部署必須為 `jwks` 或 `remote`。**真實 OAuth 未接通前，不得宣稱正式整合驗收通過**（Gate E ⑧）。
-
----
-
-## 七、必要文件規格
-
-| 檔案 | 內容要求 |
+| 目錄 | 職責 |
 |---|---|
-| `README.md` | **本套件的用途**：Beacon.js 是什麼（wss 遊戲大廳）、解決什麼問題、系統圖、需求（Node 26）、安裝與啟動、wss 協定摘要與訊息範例、驗證／遊戲伺服器 API 設定方式、開發與測試指令、授權（Apache-2.0）宣告 |
-| `AGENTS.md` | **本套件的撰寫方式**：TypeScript 規範（ESM、`strict`、禁止 `any` 敷衍）、建置與測試指令、程式碼結構（對應二節目錄）、提交慣例、**安全性架構章節＝第六節全部規則（逐條編號，作為實作與審查硬規則）**、外部 API 一律經 adapter 介面不得散落呼叫 |
-| `CLAUDE.md` | 僅**引用 `AGENTS.md`**（一行指向 + 摘要），並強調安全性架構須遵守——不重複內容，避免雙真值來源 |
-| `PLAN.md` | **本企劃書全文匯入之定案稿**（內容與桌面版一致；企劃書更新時同步） |
+| src/net | 只接受 loopback 的 public／private control 傳輸、配額、心跳、背壓 |
+| src/protocol | schema、版本、錯誤碼、requestId outcome 帳本 |
+| src/auth | remote／JWKS／mock、HTTP 邊界與私密憑證、撤銷 |
+| src/games | 註冊表、capability、場次／admission／profile adapters |
+| src/lobby | 房間、社交、邀請、結果、聊天、提案與 bounded pure matcher |
+| src/security | scrypt、常數時間驗證、來源／頻率限制 |
+| src/store | SQLite schema 5、normalized domain_records、backupDatabase／migration |
+| src/cluster | etcd JSON gateway client、協調 worker、leader RPC／gateway routing |
+| src/ops、src/log | 私有管理／診斷、備份／告警／還原與安全日誌 |
+| src/client、packages/client | SDK 型別原始碼與獨立可發佈產物 |
+| scripts、test | 使用者主動部署／驗收／容量／HA 工具、node:test 行為回歸 |
 
----
+- Runtime 唯一第三方依賴是鎖定的 ws；SQLite、HTTP、crypto、測試均用 Node 內建。SDK 無 runtime dependencies，不 import ws。
+- 所有房間／領域變更由 RoomManager 序列化；外部 auth／game／profile HTTP 與 scrypt 在佇列外，返回後重驗身分、群組、房間、提案與 reservation。
+- 多實體 mutation 以 SQLite transaction 原子提交；輸出／關閉等可見 side effects 延至提交後。失敗還原記憶體與 staged cache，不能先成功再吞儲存失敗。
+- Read-only 指令不複製整個領域或寫 SQLite；immutable domain records 以結構共享與鍵差異持久化，小寫入不反覆 serialize 全部聊天／結果歷史。
+- 已 shutdown 的 manager 不再排新 SQL；shutdown 保存寬限狀態、等待工作，再關 store，不讓延遲 socket callback 寫入已關閉資料庫。
 
-## 八、倉庫與部署
+## 三、通訊協定（protocol v3）
 
-- **前置三檔（R10）**：`CNAME`（內容 `beacon.js-package.xyz`）、`LICENSE`（Apache 2.0 全文）、`.nojekyll` —— **已於 main**，2026-10-03 經 GitHub API 驗證（倉庫僅此三檔、3 commits）。三檔齊備後才開始寫程式。
-- **介紹頁**：`index.html`（GitHub Pages，`CNAME`＋`.nojekyll` 已可作用）——目前網址回 **404**（Pages 已接但無 index.html），列為 Phase 4 交付。
-- **wss 服務部署（現階段定案；機房遷移另案——使用者裁示 2026-10-03 取消 GCP）**——與 GitHub Pages 無關（Pages 不支援 WebSocket）：
-  - **現階段（暫定）＝使用者的 Mac mini M1**（Apple Silicon、macOS、Node 26；launchd 開機自動啟動；macOS 防火牆僅允許必要程式）——**本程序本地監聽 `127.0.0.1:34568`（port 配置於 `config.yaml`，R11）**。
-  - **連外方式已定案（使用者裁示 2026-10-03）＝Cloudflare Tunnel**：`cloudflared` 以 LaunchDaemon 隨開機啟動，把 `wss://lobby.ysgs.app` 轉送至 `127.0.0.1:34568`——**不開路由器埠、不受家用浮動 IP 影響、TLS 由 Cloudflare 終結（自動管理無續期問題）、仍維持僅 WSS**（`ysgs.app` NS 已驗證在 Cloudflare）。需使用者於 Cloudflare 後台建立 Tunnel 並指派 `lobby.ysgs.app` hostname（見假設 6b）。port forward 443＋自動憑證**僅列備援**，不採為預設。
-  - **後續（不設時機，GCP 已取消）**：穩定對外上線後**另覓機房（亞洲／美西，另案裁示）**——屆時僅替換主機與啟動方式（Linux 主機用 systemd、防火牆僅開 22 限 IP 與 443），**程式與 `config.yaml` 不因遷移改動**。
-  - 網域與 TLS：**`lobby.ysgs.app` DNS 指向現階段主機**（Cloudflare A 記錄或 Tunnel，由使用者設定）；代理僅轉送 WebSocket 升階——**一般 HTTP 請求一律拒絕**；對外位址固定 **`wss://lobby.ysgs.app`**；憑證續期自動化列入部署說明。
-  - **設定檔 `config.yaml`（專案根目錄，唯一設定真值來源，R11）**——本地監聽 port 與對外網域皆配置於此，示例：
+每訊息是一個 JSON 物件。入站預設 4096 bytes，出站 65536 bytes；未知欄位拒絕。大型集合分頁／分包，不默默截斷。完整欄位與錯誤碼以 src/protocol、src/client 的 discriminated unions 與建置產生的 protocol.schema.json 為準。
 
-    ```yaml
-    server:
-      listenHost: 127.0.0.1    # 本地監聽位址（僅 loopback）
-      listenPort: 34568        # 本地監聽服務 port
-      trustProxy: true         # 受信任代理來源才採 XFF／CF-Connecting-IP（六.3）
-    public:
-      domain: lobby.ysgs.app   # 對外網域：僅接受 wss
-      tls: proxy               # proxy = 代理/隧道終結 TLS｜direct = 本程序持憑證
-    auth:                      # OAuth 驗證系統（另案）
-      mode: mock               # mock＝僅限本地開發（正式環境啟動即拒絕，六.11）｜jwks｜remote
-      jwksUrl: ""
-      apiUrl: ""
-    games:                     # 遊戲伺服器（另案）
-      apiUrl: ""
-      cacheTtlSec: 60
-    room:
-      emptyTtlSec: 1800        # 空房清除秒數（0＝永不）
-    db:
-      path: data/beacon.db      # SQLite 資料檔（0600＋WAL）
-    limits: {}                 # 六節各項配額預設值
-    ```
-  - **部署作業模式（使用者裁示 2026-10-03，混合）**：**開發與測試在本執行環境（MacBook Air M5）完成**；**部署與現階段主機上的驗證由使用者於 Mac mini 操作**——執行 Agent 產出部署腳本、逐步指令與逐項驗收 checklist，使用者依序執行並回報每步輸出；執行 Agent 不直接 SSH 遠端主機。
-  - 備份／還原：**房間資料檔 `data/beacon.db` 需備份**（SQLite backup API 或 checkpoint 後複製）；主機重建＝重跑部署腳本＋還原 DB——流程寫入 README，部署腳本同步交付。
+### 生命週期與主要命令
 
----
+1. WSS 升階檢查 → hello（protocolVersion=3）→ 10 秒內 auth。
+2. auth_ok → session／room／friend／party／invitation／queue／proposal／未 ACK 結果快照 → terminal result。
+3. select_game 後才能列／建／加入房間；token 到期前同身分 refresh_auth。
+4. peer heartbeat 清死連線；同玩家最新驗證連線取代舊連線（4001），不准未驗證 playerId 直接取席。
 
-## 九、風險與因應
-
-| 風險 | 影響 | 因應 |
-|---|---|---|
-| 驗證系統 API 契約未定案 | `auth` 無法實串接 | 四.1 先定契約＋Mock；AuthProvider 介面隔離，換實作不動大廳邏輯 |
-| 遊戲伺服器 API 契約未定案 | 遊戲清單／上限來源不穩 | 四.2 adapter + 60 秒快取 + 啟動期設定檔備援 |
-| 加密碼房暴力猜密碼 | 房間被侵入 | 六.4 頻率限制 + 斷線；可列後續（指數退避） |
-| 滿員加入競態（同秒雙人加入） | 超過上限 | 六.5 預留名額機制；列入 Gate C 測試案例 |
-| 惡意連線洪水／巨型訊息 | 資源耗盡 | 六.3 配額、六.6 尺寸與解析失敗斷線、六.10 背壓 |
-| WebSocket 幀層實作的邊界漏洞 | 資安風險 | **已定案採 `ws`（2026-10-03 裁示）**，自製 RFC 6455 不採用；執行期唯一第三方相依，CI 跑 `npm audit --omit=dev` |
-| Node 26 相依相容性（含 `ws`） | 啟動失敗 | 本機 v26.3.1 實測；Gate A 以 Node 26 建置＋啟動驗證 |
-| 介紹網址 404 | 對外無門面 | Phase 4 交 `index.html` |
-| SQLite 寫入失敗／資料檔損毀 | 操作失敗或資料遺失 | 寫入失敗 → 回 `storage_error`、記憶體不變（五）；檔損毀 → **拒絕啟動並保留原檔**（不自動清空），人工還原備份；定期備份（五） |
-| `node:sqlite` 在 Node 26 API 有缺口 | 儲存層受阻 | 實作期驗證；有缺口改 `better-sqlite3`（新增執行期相依與原生編譯）並同步更新假設 3 與二 |
-| 單節點瓶頸 | 大量連線 | 上限參數化（六.3、六.10）；水平擴充列為未來版 |
-| 現階段 Mac mini M1 停機／休眠／家用網路中斷 | 大廳中斷 | launchd 自動重啟、`pmset` 關閉休眠；重建＝重跑部署腳本＋還原 `data/beacon.db`（五）；穩定上線後遷移機房（八）可消除 |
-| TLS 憑證過期 | wss 中斷 | Tunnel 模式下憑證由 Cloudflare 自動管理（無續期作業）；備援路徑（Caddy / certbot）自動續期並列入部署說明 |
-| Cloudflare Tunnel 中斷／Cloudflare 帳號異常 | 對外 wss 中斷 | `cloudflared` 以 LaunchDaemon 自動啟動與重連；本地服務本身不受影響（僅對外不可達）；備援路徑可臨時切換 |
-| 部署由使用者操作（混合模式） | 指令誤植、驗證盲區 | 部署全程指令化＋逐項驗收 checklist；每步要求回傳輸出核對；失敗可重跑（DB 可由備份還原） |
-
----
-
-## 十、里程碑與 Gate（逐關通過才進下一階段）
-
-### Phase 0 — 倉庫前置三檔（R10）
-推送 `CNAME`、`LICENSE`、`.nojekyll`。
-**Gate 0**：遠端 main 含三檔且內容正確（`CNAME` = `beacon.js-package.xyz`、`LICENSE` 為 Apache 2.0 全文、`.nojekyll` 存在）。—— **已達成**（2026-10-03 驗證）。
-
-### Phase 1 — 骨架與協定
-TS 專案初始化（`tsc`、ESM、`strict`）、TLS + wss 接受連線、心跳、`src/protocol/` 訊息型別與 schema、錯誤碼表、Mock AuthProvider、Mock 遊戲註冊表。
-**Gate A**：`tsc --noEmit` 零錯誤；Node 26 啟動並完成一次 wss 連線→`hello`→`auth`(Mock)→`select_game`→`lobby_state`；**`data/beacon.db` 初始化成功（建表＋`schema_migrations`）**；`node --test` 單測通過（協定解析、錯誤碼）；**非開發模式下綁非 loopback 的明文 ws 啟動被拒絕、本機層僅接受 loopback 來源**（六.1 分層：外網僅 wss、本機 upstream 僅回環——兩者不衝突）；`auth.mode=mock` 且無開發旗標時拒絕啟動（六.11）。
-
-### Phase 2 — 驗證與遊戲註冊表實作
-`JwksProvider`／`RemoteVerifyProvider` 對接驗證系統 API（或 Mock 伺服器模擬遠端），遊戲註冊表對接遊戲伺服器 API（含 TTL 快取、失敗備援）。
-**Gate B**：以模擬外部 API 完成真實 HTTP 路徑驗證：有效 token → `auth_ok`、過期／錯誤 token → `auth_fail`＋斷線；遊戲清單與 `maxPlayersPerRoom` 正確載入並快取過期重取；外部不可達時 fail-closed 與備援行為符合六.2／四.2。
-
-### Phase 3 — 大廳與房間
-建房（含密碼雜湊＋落庫）、房間列表（依遊戲範圍）、加入（密碼、滿員）、離開、房主移交、`delete_room` 解散（落庫刪除）、空房 TTL 清除、**SQLite 持久化與重啟重載（R12）**、`lobby_update`／`room_state` 即時推播、切換遊戲。
-**Gate C**：整合測試（`node --test` + 假 wss 客戶端）通過——①未 `select_game` 取不到房間（R4）；②房間列表僅同遊戲（R5）；③密碼房錯誤密碼不可入、正確密碼可入、列表不洩漏密碼（R6）；④**同秒雙連線加入不超過 `maxPlayers`**（R7、六.5）；⑤空房 TTL 清除與 `delete_room` 解散推播正確；⑥頻率限制與 4 KB 上限實際觸發；⑦**重啟服務後房間仍在（R12）**——寬限未過的席位可恢復且仍須重新驗證，已過期則成員清空、首位加入者成為新房主（原房主回歸不恢復權限）、`delete_room` 落庫刪除、空房 TTL 計時正確；⑧**持久化失敗語意**——注入 DB 寫入失敗 → 回 `storage_error` 且記憶體無任何變化；損毀 DB 檔 → **拒絕啟動且原檔完整保留**（五）；⑨**邊界規則**——加入途中斷線釋放預留名額、同 `playerId` 第二條連線使舊線收 `session_replaced`、跨遊戲加入回 `wrong_game`、解散後房內成員自動回到遊戲大廳（三·邊界規則）。
-
-### Phase 4 — 安全驗收、文件與介紹頁
-第六節全數落地並複查；四份必要文件撰寫；`index.html` 介紹頁。
-**Gate D**：安全性逐條 checklist（六.1–6.10）全過，日誌抽查無 token／密碼明文；`README.md`、`AGENTS.md`（含安全章節）、`CLAUDE.md`（引用 AGENTS.md）、`PLAN.md`（本企劃書全文）齊備並推上 main。
-**Gate E（交付關）**：①`git` 遠端 main 含全部檔案；②三檔前置內容仍正確；③介紹網址回 200；④以 Node 26 乾淨 clone → 安裝 → 建置 → 啟動 → 走完三.流程範例一次成功；⑤**依部署腳本部署至現階段主機（Mac mini M1；使用者操作，混合模式；本地監聽 `34568` 由 `config.yaml` 配置），從外部以 `wss://lobby.ysgs.app` 完成同一流程範例**（TLS 有效、無需對外開埠），驗收以使用者回報之逐步輸出核對；⑥對 `https://lobby.ysgs.app` 發一般 HTTP(S) 請求**不得**取得任何網頁（僅 WSS，符合六.1）；⑦`config.yaml` 改網域／port 後重啟即生效、程式無需修改（R11）；⑧**整合驗收不得以 Mock 通過**——正式部署 `auth.mode` 不得為 `mock`（六.11），真實 OAuth 至少完成一次成功驗證才可宣稱整合驗收通過；驗證系統（另案）未接通時，本關只能結論為「**開發＋部署驗收通過，整合驗收 blocked**」，不得隱瞞。
-
----
-
-## 十一、已知假設與未定項
-
-1. **Node.js v26 為指定執行環境**（使用者裁示）；本機實測 `node -v` = **v26.3.1**。若部署主機版本不同，以 ≥ 26 為準並於 README 標明。
-2. **驗證系統 API 契約未定案**（另案）——**開發策略已定案（使用者裁示 2026-10-03）：先 Mock＋抽象契約開發**（四.1：JWT-JWKS 預設、伺服器 verify 端點備用、`MockAuthProvider` 落地），契約確定後**只換 `src/auth/` adapter**，不擋其他部分進度；與驗證系統實際定案衝突時，**以驗證系統為準**。
-3. **依賴策略已定案（使用者裁示 2026-10-03）**：執行期第三方相依＝`ws`（理由見二），自製 RFC 6455 不採用；儲存層預設用內建 `node:sqlite`（零新增相依），**若實作期改用 `better-sqlite3` 則成為第二個執行期相依**，須同步更新本條與二（見假設 8）。
-4. **遊戲伺服器 API 契約未定案**（另案）：以 `GET /v1/games`（含 `maxPlayersPerRoom`）先行定案（四.2）；實際格式不同只改 `src/games/` adapter。`serverHint` 為可選欄位，遊戲伺服器未提供即省略。
-5. **介紹網址現為 404**：CNAME（`beacon.js-package.xyz`）已生效並指向 Cloudflare，但 Pages 無 `index.html`——介紹頁列 Phase 4。
-6. **部署平台與設定（使用者裁示 2026-10-03）**：**現階段＝使用者的 Mac mini M1（Apple Silicon）**——本程序**本地監聽 `127.0.0.1:34568`**、對外 **`wss://lobby.ysgs.app`（僅接受 WSS，不提供一般網頁）**；**GCP 已取消（使用者裁示 2026-10-03）**——**穩定對外上線後另覓機房（亞洲／美西，另案裁示，不鎖定特定雲端）**，屆時僅換主機與啟動方式。**port `34568`、`lobby.ysgs.app` 及其餘部署設定一律配置於根目錄 `config.yaml`（R11），程式不得寫死**。**連外方式已定案（使用者裁示 2026-10-03）＝Cloudflare Tunnel**（免開路由器埠、TLS 由 Cloudflare 終結、維持僅 WSS）；port forward 443＋自動憑證僅列備援。**部署操作已定案（使用者裁示 2026-10-03，混合模式）**：開發與測試在本執行環境（MacBook Air M5）完成；**部署與主機端驗證由使用者於 Mac mini 依執行 Agent 產出之腳本與指令操作並回報輸出**（不 SSH 遠端）。**待定項**：a) **需使用者於 Cloudflare 後台建立 Tunnel 並指派 `lobby.ysgs.app` hostname**（`ysgs.app` NS 已在 Cloudflare；`lobby.ysgs.app` 目前無 DNS 記錄），並提供 `cloudflared` token／憑證給部署作業；b) 未來機房（亞洲／美西）之選擇——**穩定對外上線後**另案裁示。a–b 不影響程式實作，僅影響八的部署作業。
-7. **無前端大廳 UI**：功能敘述未要求，列範圍外；若需要展示頁另立企劃。
-8. **房間持久化已拉進範圍（使用者裁示 2026-10-03，R12；v2 修訂寬限席位）**：房間資料存 SQLite（`data/beacon.db`）——預設採 Node 內建 **`node:sqlite`**，其在 Node 26 的 API 狀態**於實作期驗證**；若有缺口改用 `better-sqlite3`（新增執行期相依），並同步更新假設 3 與二。**連線與配對佇列不持久**。寬限未過的席位可恢復，已過期則成員清空、首位加入者成為新房主（見三·邊界規則 5）——語意見五；空房依 `room.emptyTtlSec`（預設 1800 秒）清除，為**新創預設值，可調整**。
-9. 頻率限制、配額、上限等數值（六.3、6.4、6.6、6.7、6.10；三節入站 4 KB／出站 64 KB／`pageSize` 預設 50 上限 200；`room.emptyTtlSec` 1800）為**新創預設值，可調整**。
-
-### 十二、v2 擴充（使用者裁示 2026-10-04：全部實作）
-
-v1 的邊界是「安全的房間目錄與成員管理」。v2 補上讓大廳能支撐完整組隊、開局與長時間遊玩的閉環，**仍維持「大廳負責組隊與交接、遊戲伺服器負責遊戲邏輯」**——Beacon 不做遊戲邏輯與同步。
-
-| 編號 | 需求 |
+| 類別 | 命令 |
 |---|---|
-| R13 | 準備／開局：房間狀態 `open → starting → in_game → open`；房主於全員準備後 `start_game`，經 `GameSessionProvider` 對遊戲場次 API 建立場次、各玩家只取得自己的 ticket；結果不明確時保留 `starting` 與原請求，以同一 idempotency key 重放，不虛構完成；加入政策 `closed`／`fill`／`spectate`，觀戰者容量獨立 |
-| R14 | 重連：斷線保留席位與準備狀態 `lobby.reconnectGraceMs`，**必須重新驗證**才可恢復；擁有者（建立者）與房主（主持人）分離 |
-| R15 | 協定 v2：`requestId` 關聯與終結訊息 `result`；同玩家同 id 同內容冪等重播、不同內容 `request_conflict`；`revision`／`snapshotId`／穩定游標；`hello` 協商 `protocolVersion`；單一項目超過出站上限時以 `snapshot_chunk` 切段而非截斷 |
-| R16 | 房主工具：改名／改密碼／改上限／可見度／上鎖／加入政策、踢人與房間封鎖、移交房主、受邀制（邀請綁定對象與房間） |
-| R17 | 身分：同連線 `refresh_auth`（同一玩家）、`auth.revocationUrl` 撤銷（fail-closed）、管理員封禁與撤銷（持久化）、玩家建房配額、**跨連線**密碼猜測限制 |
-| R18 | 找房：關鍵字、排序、僅可加入、版本／模式／區域相容性、`quick_join`；官方 SDK `src/client/` |
-| R19 | 社交：雙方同意的好友與在線狀態、隊伍、以隊伍為單位不拆開的 FIFO 自動配對 |
-| R20 | 維運：loopback 且全端點 bearer 認證的管理 HTTP（health／ready／metrics／audit／ban／unban／revoke／rooms-close／maintenance）、持久稽核、告警 webhook、輪替遮蔽日誌、排程 SQLite 備份與隔離還原演練、維護模式與關機排空（`server_draining`）、本機容量情境 |
+| 身分／同步 | auth、refresh_auth、sync_state、ping |
+| 大廳／房間 | list_games、select_game、switch_game、list_rooms、list_owned_rooms、create_room、join_room、quick_join、leave_room、delete_room |
+| 房主 | ready、start_game、update_room、kick_player、unban_player、transfer_host、invite_player |
+| 社交 | friend_request、friend_respond、friend_remove、list_friends、block_player、unblock_player、list_blocks |
+| 邀請 | list_invitations（incoming／outgoing）、decline_invitation、revoke_invitation；join_room／party_accept 是真實接受路徑 |
+| 隊伍 | party_create、party_invite、party_accept、party_leave、party_transfer_leader、party_kick、party_disband、party_join_room |
+| 配對 | queue_join（basic／advanced、rolePreferences）、queue_leave、match_accept、match_decline |
+| 私人結果 | list_match_results（cursor／limit）、ack_match_result（resultId） |
+| 聊天 | chat_send、chat_history（room／party）、chat_mute（scope／playerId／until）、chat_report（messageId／reason） |
 
-**實作中發現並修正**：①`node:sqlite` 非同步 `backup()` 在程序有其他 handle 時不會被自身進度喚醒，排程備份與啟動會被拖延（實測 30 秒）——`backupDatabase` 以短暫計時器處理；②房間內的準備／重連等變更原本會推給整個大廳，實測 800 位大廳在線者的情境下每個請求約 602 則訊息，改為僅在列表可見欄位改變時推播後降為約 404 則。
+### 關聯、重播與分包
 
-**已裁示（2026-10-04，對齊實作）**：`lobby.maxRoomsPerPlayer` 仍計入擁有者已離開的空房，不在建新房時靜默回收。擁有者以 `list_owned_rooms` 查看，並以 `delete_room{roomId}` 刪除沒有其他成員、保留席或預留名額的空房。
+- 直接回應用 Peer.reply 帶原 requestId；廣播用 Peer.send，不帶 requestId。
+- 成功以 result{ok:true} 結束，失敗以 error{ok:false,code,message} 結束；收到廣播或第一個中間 response 不代表完成。
+- 同玩家／相同 requestId／相同內容重播原直接 outcome；不同內容 request_conflict。只存請求內容雜湊，auth／refresh／ping／list／sync 不納入 mutation cache。
+- Replay 帶 replayed／resyncRequired；SDK 先取得完整新 sync 再暴露 live state，不以舊 room_joined／leave response 復活已刪或錯清新房。
+- 房間／大廳 revision 各自處理；snapshotId、0 起算 chunkIndex 與 chunkCount 必須收齊後原子套用，不能混合不同快照。單一巨大項目用 snapshot_chunk JSON payload 切段。
+- 房間 cursor 是原玩家限定的穩定快照，逾期 snapshot_expired；游標／連線不持久。
+- SDK convenience methods 接 RequestOptions.signal；abort 釋放 listener／deadline／request 等待，不承諾撤銷已提交 server 操作。mutation 僅明確 retryOnReconnect 才以原 id 重試。
 
-**玩家封鎖、撤銷認證與告警（契約）**：`block_player`／`unblock_player`／`list_blocks` 持久化於 schema v3 的 `blocks`，上限 100；阻擋好友請求、房間／隊伍邀請，以及與被封鎖者配成同一場。非 mock 且設定 `auth.revocationUrl` 時，`revocationTokenFile` 必填，GET 帶 `Authorization: Bearer`。告警 webhook 本文只有 `service`、`event`、`severity`、`id`、`at`：`backup_failed` 為 `critical`，`not_ready` 為 `warning`，不含玩家 ID 或憑證。場次結束與個人結果經已認證的 `POST /matches/result`、`POST /matches/player-result`；個人結果只送給該玩家，離線則暫存到席位，重連後送出。房間 `rules`（至多 16 鍵、JSON 1024 bytes）隨 `POST /v1/matches` 轉發，空物件表示清除。
-**限制**：本機容量情境是單機、同程序客戶端的回歸量測，不是正式容量保證；真實 OAuth 與遊戲場次 API 尚未接通，整合與外部部署驗收仍為 blocked（見 Gate E ⑧）。
+### 房間與社交邊界
 
----
+- owner 是建立者，host 是主持人；房內只有 host 可改設定／解散。owner 可 list_owned_rooms 後刪自己的無其他成員／寬限席／reservation 空房，空房仍計配額。
+- host 離開後移交最早在線／保留玩家，無人回 owner；首位成功加入空房者成為新 host，原 host 回來不自動恢復權限。
+- 加入先檢查並預留，再於佇列外驗密碼／admission；失敗／斷線釋放全部預留，最後重驗狀態、容量、版本、遊戲、封鎖與邀請。
+- 隊長整隊加入也遵循上述流程且同一 transaction，不留下半隊或半個 accepted invitation。
+- 房間設定變更／刪除、隊伍終止／變更、封鎖等會撤銷相關 pending 邀請；終態保留至 invitationRetentionMs。token 只給有權寄收件人，不能列第三方 mailbox。
+- 配對先提案，不提前配置房間；全員接受才建房。拒絕／期限／斷線／維護／社交變更取消提案，其餘合格群組保留 queuedAt 回列；離線者不被新配對。
+- block 是持久原子操作，清理舊社交同意與不相容群組；解封必須重新建立同意，不能接受封鎖前的舊 request。
 
-開始執行。
+### 聊天、結果與可見性
+
+- 房間／隊伍訊息有穩定 id、時間、scope、原收件人集合；即時與歷史均檢查封鎖、原收件與目前成員資格，新成員不得取得舊私人歷史。
+- 聊天專用 rate bucket 加上連線全域限流；字數預設 500、最高 2000，仍受 4 KB frame 約束；歷史、報告、禁言各有容量／保留／時長設定。
+- 只有 host／leader 可 mute 合格成員；只有有權看訊息者能 report；有限原始證據持久保留，僅受保護管理 API 可審查／dismiss／mute／ban。
+- durable match 保存原始參與 roster，不因房間、席位或目前遊戲切換遺失。晚結果僅接原 roster 身分；同內容回報冪等，不同內容衝突。
+- 私人 resultId／內容／ACK 獨立持久。list_match_results 返回本人含已 ACK 歷史，登入／sync 只推未 ACK；SDK state.results 只表示 pending inbox，history query 不復活已 ACK 通知。
+- 場次、結果、聊天、提案、邀請等清理均遵守配置上限／保留政策；不得因「已傳送」立即刪結果。
+
+## 四、外部 API 契約
+
+這些是 Beacon adapter 契約，不宣稱另案真實後端已上線。格式不同只改 adapter，不能把 HTTP 散落到大廳。
+
+### OAuth／撤銷
+
+- JWKS：RS256，驗 exp／iss／aud，取 sub／name、iat／jti；不由 Beacon 發 token。
+- remote：POST {auth.apiUrl}/v1/verify，Authorization: Bearer 玩家 token；200 {playerId,displayName,issuedAt?,tokenId?}，401 拒絕。身分／名稱各最多 128 UTF-8 bytes。
+- auth.mode=mock 僅 --dev-mock-auth 開發／測試；正式為 jwks／remote，無匿名 fallback。
+- 設定 revocationUrl 後是必要依賴：GET 受保護撤銷清單 [{playerId?,tokenId?,revokedBefore?}]，非 mock 必須 bearer；拉取失敗拒絕新 auth 並中斷現有連線。缺 issuedAt 不得用 authAt 補。
+
+### 遊戲清單、能力與場次
+
+- GET {games.apiUrl}/v1/games → [{gameId,name,maxPlayersPerRoom,enabled,serverHint?,versions?,modes?,regions?,capabilities?}]。遊戲 ID／name 128 bytes、hint 1024 bytes；相容性陣列各 32 項／64 bytes。快取預設 60 秒；API 不可達使用明確標示 cache／config 的備援，不假稱真串接。
+- capabilities 包含 joinPolicies、minPlayers、rules、roles、teams{count,size,requiredRoles}；rules 是 boolean／number／string descriptor，含合法 default、range、integer、enum 或長度。配置／清單載入驗證 descriptor，操作重驗；未提供 descriptor 的既有遊戲維持合法原行為。
+- rules 至多 16 鍵、鍵 32 字元、字串 128 code points、JSON 1024 UTF-8 bytes；值為有限且安全範圍內的數值／字串／布林，number 可小數，integer:true 才限制整數，敏感 credential key 拒絕。
+- POST {sessionApiUrl}/v1/matches：Idempotency-Key=operationId，body 含 operationId／roomId／gameId／版本／模式／區域／players／joinPolicy／rules；玩家 team／gameRole 與配對 assignments 一致。回 matchId／serverUrl／expiresAt／各玩家 tickets。
+- POST /v1/matches/:id/admissions：{playerId,role} → 本人 serverUrl／ticket／expiresAt；GET 該 match 查 starting／in_game／ended／failed；DELETE 取消。URL 僅 HTTPS／WSS、禁止 URL 內憑證；回應大小與期限有界。
+- GameSessionProvider 是最終場次權威，open／starting／in_game 轉換、持久 operationId 與重驗避免 callback 競態；serviceTokenFile 私密，未設定 API 明確 game_service_unavailable。
+- 結束與個人結果經 bearer 管理 HTTP POST /matches/result 與 /matches/player-result。單機／HA 均保留原 match／roster，不要求房間仍存在。
+
+### 可信配對 profile（新增提案契約）
+
+POST {profileApiUrl}/v1/matchmaking/profiles；service bearer，body {gameId,playerIds}，回 {gameId,profiles:[{playerId,skill,regionRttMs,measuredAt}]}。
+
+- 技能由遊戲後端維護，有限 0..1000000；regionRttMs 由後端實測，整數毫秒 0..60000；measuredAt 為 epoch 毫秒。
+- 每個要求的身分恰有一筆，單次最多 256；缺漏／多出／重複／錯遊戲／未來／過期均拒絕。profileMaxAgeMs 是硬 freshness 界線。
+- advanced 沒有後端、service bearer 或新鮮資料即 profile_unavailable；不接受 client 自報 skill／RTT，不靜默降級 basic。
+- matching 設定所有技能範圍、隊伍技能差、RTT 上限、等待放寬起點／間隔／步長／最大值、searchLimit。pure matcher 先檢查容量／角色供給，搜尋有界且不拆隊；預算耗盡明確回 matchmaking_search_exhausted 並保留佇列。
+- 維護不需新 queue_join 即可按等待門檻再配；profile 更新在佇列外並重驗當前群組／身分，接受提案也重驗，變成無效不能配置房間。
+
+## 五、資料模型、遷移與耐久性
+
+| 層 | 資料／權威 |
+|---|---|
+| 連線記憶體 | WebSocket／auth session／deadline／正在進行 reservation，重啟需重新 auth |
+| SQLite rooms／social／moderation／audit | 房間與密碼雜湊、擁有者／房主、seats、好友、隊伍、帶寄收件者終態邀請、封鎖、管理處分與稽核 |
+| SQLite domain_records(kind,id,data) | 正規化 match／private result／chat／report／mute／queue／proposal records；不是每次寫全 domain blob |
+| HA etcd | leader lease／epoch、鍵差異 request outcomes、原生 SQLite changeset journal、分塊 checkpoint manifest；跨主機權威 |
+| 各主機本機 DB | authority／worker materialization，保護 DB、WAL、SHM 與 replica 檔，不共用網路檔案 |
+
+- schema 5；啟動原地 migration、先備份。舊席位 pendingResult lossless 搬到私人 inbox；缺可信 sender／createdAt／status 的舊邀請失效，不能猜 sender 授權。錯誤／損毀不清空資料。
+- 每次改動僅寫 changed keys／records；nested transaction staged cache 與 SQL 一致，rollback 也恢復 cache，不能讓暫加再刪的資料殘留。
+- 單機：SQLite COMMIT → 記憶體／可見輸出 → 成功。HA：同 transaction 的 changeset 先經 etcd epoch-guarded commit → 本機 COMMIT → ACK；遠端提交後本機失敗立即 self-fence，不能留下兩個 writer。
+- Native applyChangeset 衝突 abort，不 OMIT／REPLACE 掩蓋還原不一致。Checkpoint 有界分塊、manifest／hash／大小驗證；小 mutation 不輸出整個 SQLite snapshot。
+- lease／quorum 失效：拒絕寫入／新 auth，關閉受影響 tunnels，舊 writer 即使暫停後恢復也不得提交或送過期 authority 的私人 ticket／ACK。
+- durable outcome 綁 player／requestId／canonical payload hash。已知終態 TTL 淘汰；未知 outcome 留有界 indeterminate tombstone，不能因 TTL 到期重新執行。不明結果先查 provider／reconcile，禁止換 id 盲重試。
+- queue／proposal、結果／ACK 與 chat 可重載；在線連線、列表 cursor 不持久。重新 auth 後才恢復席位與合格配對，不能把離線 roster 當在線。
+- 備份一律 backupDatabase；不可直接複製運作中的 DB／WAL，亦不可直接呼叫可能卡住的 node:sqlite backup。單機還原需停止 writer、保留舊 DB／WAL／SHM、驗證備份再換檔。
+- HA 災難還原需保存／還原 etcd authoritative snapshot 與私有設定；現存 quorum 會覆蓋本機舊資料，不能只換一份 SQLite 回滾全群組。停全部 Beacon、只啟一個確認一致的 quorum，禁止 split restored clusters。
+
+## 六、安全性架構（十四條硬規則）
+
+1. **傳輸分層**：外網僅 WSS／設定 domain、一般 HTTP(S) 403／426；app upstream 與 control／ops 只綁 loopback 且拒絕非 loopback 來源。Cloudflare TLS 終結後的本機 upstream 不解除外網 WSS 規則。開發明文只限明確旗標；direct TLS 仍只 loopback。
+2. **驗證前置**：預設 10 秒內 auth，失敗後斷線；外部驗證不可達 fail-closed，無匿名 fallback。
+3. **來源與配額**：Origin 白名單；無 Origin CLI 由設定決定；預設每 IP 10、總量 5000、新連線 5/10 秒。只有受信任 loopback／代理來源才採 CF-Connecting-IP／XFF 最右可信值，其餘用 socket remoteAddress。代理同驗 forwarded HTTPS 與 exact Host，不能相信 client 自造標頭。
+4. **密碼**：每房獨立隨機 salt、scrypt 與 timingSafeEqual；不入日誌／推播／列表；預設 5 次/分鐘/玩家、跨連線不重置，重啟不持久。
+5. **競態與容量**：同步預留 → 佇列外驗密碼／admission → 重驗／原子確認或全部釋放；整隊也不得超員／拆隊。
+6. **輸入**：入站 4 KB、三次 JSON 解析失敗即斷線；所有欄位型別／長度／字元集驗證，未知欄位拒絕，房名 1–32 字、禁止控制字元。
+7. **限流**：每連線預設 20/10 秒 token bucket，超限 rate_limited、連續違規斷線；聊天另有專用 bucket／保留容量。
+8. **憑證與日誌**：token／JWT／password／ticket／admission／authorization 一律遮蔽；外部任意 response body、錯誤訊息、堆疊可能回顯憑證，連伺服器診斷也不記，只記安全分類／欄位。聊天本文不入一般日誌。
+9. **供應鏈／資料**：runtime 只有 ws、lockfile、CI npm audit --omit=dev；不使用 eval／Function 或 user-input dynamic require。SQLite／WAL／SHM／replica、secret／password／私鑰與備份均私密；資料檔預設 0600，路徑來自 config。
+10. **資源**：ping／pong 回收、highWaterMark／背壓、慢連線踢除、每遊戲預設 1000 房；入出站、分頁、聊天／結果／報告、配對搜尋、checkpoint／journal／request cache 皆有界，不靜默截斷正規快照。
+11. **驗證模式**：mock 只 --dev-mock-auth 開發／測試；正式 jwks／remote，不用開發旗標部署；真實 OAuth 未接通不得宣稱正式整合驗收通過。
+12. **管理**：只 loopback，每個端點含 health／ready／metrics 都 bearer；token 為 0600 一般檔、拒絕符號連結／過寬權限，常數時間比對；嚴格 body／欄位限額，mutation 持久稽核，metrics 僅彙總。
+13. **場次隱私**：ticket／admission／私人結果只給本人，不能廣播／日誌／metrics；冪等請求內容僅 hash，不能保存原 token／房密 request body。結果回報驗原 roster，不以目前房間成員代替。
+14. **撤銷 fail-closed**：設定 revocationUrl 後不可達即拒絕新 auth 並中斷現有；缺 token 簽發時間時 revokedBefore 視為撤銷，不以 authAt 代替。
+
+**HA 補充**：production etcd endpoints 必須 HTTPS、專屬 user／private password／CA，選用 client cert／key 成對；私有 control 必須 WSS、server cert／key／CA、shared bearer、loopback 與 forwarded IP／Origin／Host 重驗。development:true 仍必須 --dev-insecure-ws，HTTP／WS 只允許 loopback。privileged etcd 管理／compaction／defrag／snapshot 由基礎設施擁有者執行，app 不改全域 cluster 保留政策。
+
+Cloudflare **另設 block 規則**拒絕設定 domain 的所有 HTTP scheme，包含 WS upgrade，不能只靠 HTTPS redirect。
+
+## 七、文件與 SDK 交付
+
+| 檔案 | 規格 |
+|---|---|
+| README.md | 實際安裝／設定／protocol v3／SDK tarball／私有管理／單機與 HA 部署／備份／真實驗收與已觀察證據 |
+| AGENTS.md | 工程、架構、資料／adapter／安全硬規則；實作必須遵守，不藉本企劃弱化 |
+| CLAUDE.md | 引用 AGENTS，不建立第二套安全真值 |
+| PLAN.md | 完整現行企劃、R1–R32、架構／契約／安全／部署／風險／gates，不能只附一個不一致的 v3 待辦 |
+| packages/client | 可獨立打包 exports／d.ts／ESM／LICENSE／README／JSON Schema，未發布，不保留根 ./client alias |
+
+SDK typed subscription、BeaconResult.get 與 state 在 browser／Node 對應真實 wire；未識別／malformed 訊息不進 typed events。打包後必須在隔離 consumer 安裝 tarball、實際 import、strict TypeScript browser／Node compile，不能只斷言檔案文字。
+
+## 八、部署與內部維運
+
+### 單機與 public Tunnel
+
+- Mac mini：使用者以標準 app 身分先 build／typecheck，再明確 sudo 執行 install-launchd；app 不是 root，開機未登入由 system LaunchDaemon 啟動。existing plist 不覆寫；root 僅安裝服務，不跑 npm。
+- cloudflared 是另一個受審核 LaunchDaemon，私密 credentials JSON／token-file 不放命令列／plist／history。使用者建立 Tunnel／DNS／WSS／HTTP block 規則，loopback upstream 保留設定 Host 與 forwarded HTTPS。
+- Linux 另用 install-systemd、已存在非 root app 使用者；本次未在 Linux／Mac mini 部署，不以本機 fixture 替代。
+- config 只 flow-style JSON 與引號外 # 註解，不使用舊企劃的 block YAML 摘錄。全部完整欄位以根 config.yaml 為準，改 domain／port 與代理配置需人工同步、重啟。
+
+### 跨主機 HA
+
+1. 管理者建立 3／5 etcd 成員，分離 failure domains，client／peer 私網 TLS、專屬 prefix ACL、operator-managed compaction／defrag／snapshot；app 不安裝或重配 etcd。
+2. 每個 gateway 使用完整 config、唯一 nodeId／本機 db.path、相同 endpoints／prefix／control secret；enabled:true、development:false、HTTPS etcd 認證。控制埠仍 loopback。
+3. 每台 control 使用不同私網 wss advertiseUrl，配置可信 cert／key／CA；透過私網 TLS pass-through 或 re-encryption 代理到 loopback，保留 Host。私有 authority 不放到公開 lobby domain，ops 不對外路由。
+4. 從單機升級先停服務並 backup；只啟持有正確 DB 的一個節點 bootstrap 空 prefix，再啟其他節點。已有 authority 時所有重啟以 etcd 為真值，不合併不同舊 DB。
+5. 公開 gateway 可多個轉送 authority；所有 mutation 與私人 outbound 必須有當前 lease／epoch。失去 quorum 關閉 tunnels／拒絕 auth與寫入，重連需重新 auth／sync。
+6. leader-only 業務 admin mutation／查詢在 follower 明確 not_leader；GET /cluster 可看各節點健康／role／lease／還原進度。GET /ready 表示本節點 authority readiness，follower 503 不表示 gateway 不能轉送；quorum 失效全部 503。
+7. scripts/cluster-smoke.mjs 對專用隔離 quorum 實測 gateway／接管／pause／去重；--quorum-marker 由操作者停止兩個測試成員後建立，不能不做就宣稱通過。--tls-directory／--etcd-user／--etcd-password-file 支援真正 HTTPS auth／私有 WSS，但 OAuth／遊戲仍是本機 fixture，不能算正式整合。
+
+### 管理介面
+
+每個端點包含 health／ready／metrics 都 loopback bearer；GET audit／rooms／rooms/:id／matches／matches/:id／queue／integrations／cluster／chat/reports／chat/reports/:id 採有界安全投影。列表最多 200 與 65536 bytes 雙界線，必須依 nextCursor 續取，不能假設滿 limit。
+
+POST ban／unban／revoke／rooms/close／maintenance／matches/result／matches/player-result／matches/reconcile／chat/reports/review 持久稽核。reconcile provider HTTP 在序列化外，回來重新驗證；不以管理按鈕虛構場次成功。review action=dismiss／mute／ban，until／reason 必填，dismiss until=0，其他 future，reason ≤256 UTF-8 bytes；一般 metrics 不含身分／報告本文／ticket。
+
+排程備份只輪替自身產物；告警僅 service／event／severity／id／at，backup_failed=critical、not_ready=warning；所有停用依賴明確記分類。維護拒絕新 auth／建房／加入／配對／開局；server_draining 提供 deadline 後排空關機。
+
+## 九、風險與處理
+
+| 風險 | 因應／界線 |
+|---|---|
+| 真實 OAuth／遊戲／profile 契約未上線 | adapter 實作與明確提案契約已備；advanced／開局 fail-closed，正式 gate blocked，不假造整合證據 |
+| 單機／quorum／authority／私有網路故障 | lease／epoch、durable changeset、隔離接管／paused writer／quorum-loss 演練；實體跨主機與 SLA 還需實際部署證據 |
+| 外部配置未知 outcome | 同 operationId provider reconcile；durable indeterminate request 不過期重做；滿容量 fail-closed，不自動換 id |
+| 巨量聊天室／結果／checkpoint | 正規化 changed records、小 changeset、TTL／筆數／bytes／search budgets；不以整庫拷貝回應每次 mutation |
+| 配對組合爆炸／無角色供給 | suffix 容量與角色可行性剪枝、有界搜尋，無解／budget exhaustion 區分，保留隊伍與原年齡 |
+| 儲存提交／recovery 衝突 | SQL＋記憶體 rollback，遠端已 commit 而 local fail 立即 fence，apply conflict abort，保留證據，不吞 error |
+| 私人結果／聊天／憑證洩漏 | 原 roster／recipient 可見性、typed 嚴格 wire、admin allowlist／byte-budget、日誌安全分類與 metrics 彙總 |
+| v2／v3 或不同 namespace 資料混跑 | 服務／SDK 同步切換、先 backup／單節點 bootstrap、schema 5 migration；不保留 legacy export 或兼容 alias |
+| Mac mini 休眠／Tunnel／Cloudflare outage | 使用者審核不休眠／非 root daemon／私有備份；HA 實際 failure domains／proxy 路由另驗，不能以同機三程序保證跨機可用性 |
+| 容量／CI 跨平台未量測 | 本機容量結果僅回歸、不承諾 production；Node24／十組 CI 矩陣與其他 OS 以實際執行為準 |
+
+## 十、里程碑與驗收 Gate
+
+| Gate | 驗收要求與本次狀態 |
+|---|---|
+| 0 歷史前置 | 三檔先行推送已完成；本次不重查／重推，也不把舊發布當 v3 已發布 |
+| A 協定／建置／本機安全 | build／typecheck、限時 auth／WSS／loopback／mock 管制及 schema 回歸通過 |
+| B adapter 開發整合 | 本機 HTTP fixture 驗 auth／games／session／profile，真實 adapter 執行；不代表真實外部整合 |
+| C 房間／持久化 | 房密競態／容量／owner-host／restart／DB failure／atomic rollback 行為與 live SDK 場景通過 |
+| D 本機擴充 | R21–R31 端到端 smoke、typed schema／SDK／isolated tarball／chat moderation／immutable ACK results 通過；文件本地已同步，v3 未 push |
+| HA 本機故障證據 | 真實 etcd 3.7.2 三成員＋三 Beacon，HTTP loopback development 及 HTTPS+auth/private WSS 兩模式：共享／kill+restore／原檔重啟／去重／SIGSTOP stale writer 與延遲 ticket／quorum loss 均通過 |
+| E 正式外部交付 | **blocked**：真實 OAuth 有效／過期 token、真實遊戲與 profile、外部 WSS／HTTP block、Mac mini 開機未登入／非 root／備份還原、跨實體主機 TLS／failover／quorum、設定改動生效與安全證據；不以 mock 通過 |
+| 提交／發布 | 依使用者指示分功能提交；push／release／npm publish／Pages／production 仍需另行授權，本次未執行 |
+
+### 2026-10-04 本次實際證據
+
+- Node 26.7.0：build、typecheck、完整 node --test **144/144**、部署安全工具測試 **4/4**，npm audit --omit=dev **0 vulnerabilities**。
+- 實際 SDK → WebSocket → SQLite → HTTP game/profile：封鎖與重新同意、邀請 mailbox 終態、隊伍權限／密碼整隊入房、capability 小數 rules、聊天／report／mute、刪房後結果／重複衝突／ACK／restart、可信角色配對提案與全員接受、AbortSignal 通過。
+- 真實 Chromium／原生 WebSocket／獨立 SDK：auth、建房／owner 刪房、party state、abort 後 ping 通過，已觀察畫面／截圖，browser errors 為空。
+- 真正 npm pack tarball 13 files，隔離 npm install／Node import、browser／Node strict TS consumer 通過，無 runtime dependencies，未發布。
+- 真實 etcd HTTPS 開啟帳密認證、private control WSS、cluster.development=false 的演練也完成 quorum-loss；測試 peer 與公開 mock 都是本機 fixture，不宣稱 production 跨主機部署。
+- 容量 CLI 32 clients／4 人房／1 round／160 requests；p50 約 1.14 ms、p95 2.26 ms，最後 rooms／reservations／inFlight=0；不是正式容量保證。
+- 一次性驗證頁／腳本、私鑰／密碼、暫時 databases／etcd instances 均在交付前回收；可重用 HA／容量／部署工具留在 scripts。
+
+## 十一、已知條件與外部待備
+
+1. 根 config 預設 auth.mode=mock、games API／session／profile endpoint 空、operations／cluster 停用，正式啟動拒絕 mock 是安全設計。需要有權的真實 OAuth／遊戲／profile 端點與部署設定，不搜尋或索取任意憑證。
+2. 新 profile、capabilities／team／gameRole、結果 callback 是 Beacon 的明確契約；外部系統若不同需由所有者確認並改 adapter，不能聲稱另案已採用。
+3. 正式 HA 需 3／5 quorum 的真實 failure domains、私網 DNS／proxy／TLS／ACL／受保護 backup；本機獨立程序與自簽 fixture 證書只證程式路徑，不證基礎設施 SLA。
+4. Cloudflare Tunnel／DNS／HTTP block、Mac mini 開機與權限、真實 token 驗證／外部 WSS／真實場次與可信 profile 證據尚不可用；完成可達實作，不宣稱 Gate E 通過。
+5. CI 保留 Node24／26 十平台組合；本次只跑此 macOS arm64 的 Node26，未把 CI 設定當執行結果。
+6. npm package 名稱已選 @js-package/beacon-client，但 registry 尚未發布，也未驗證遠端命名權限；本次交付的是可安裝 tarball 與原始碼，不是已可 npm install 的公開版本。
