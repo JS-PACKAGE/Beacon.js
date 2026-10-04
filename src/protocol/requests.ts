@@ -5,6 +5,10 @@ import { ProtocolError } from './index.js';
 
 type Reply = Record<string, unknown>;
 interface Entry { digest: string; expiresAt: number; replies: Reply[]; bytes: number; completed: boolean; done: Promise<void>; finish(): void }
+export interface DurableRequests {
+  reserve(playerId: string, requestId: string, digest: string): { status: 'reserved' | 'complete' | 'conflict' | 'indeterminate'; replies?: Reply[] };
+  complete(playerId: string, requestId: string, replies: Reply[]): void;
+}
 const reads = new Set(['ping', 'list_rooms', 'list_games', 'list_friends', 'sync_state']);
 function canonical(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonical);
@@ -15,10 +19,11 @@ function canonical(value: unknown): unknown {
 export class RequestLedger {
   private readonly players = new Map<string, Map<string, Entry>>();
   private bytes = 0;
-  constructor(private readonly config: Config) {}
+  constructor(private readonly config: Config, private readonly durable?: DurableRequests) {}
 
   async execute(playerId: string, message: ClientMessage, send: (reply: Reply) => void, operation: (reply: (value: Reply) => void) => Promise<void>): Promise<void> {
     const requestId = message.requestId;
+    if (this.durable && !requestId && !reads.has(message.type) && message.type !== 'auth' && message.type !== 'refresh_auth') throw new ProtocolError('request_id_required');
     if (!requestId || reads.has(message.type) || message.type === 'auth' || message.type === 'refresh_auth') {
       await operation(value => send(requestId ? { ...value, requestId } : value));
       return;
@@ -27,7 +32,8 @@ export class RequestLedger {
     let requests = this.players.get(playerId);
     const digest = createHash('sha256').update(JSON.stringify(canonical(message))).digest('hex');
     const previous = requests?.get(requestId);
-    if (previous) {
+    if (previous && this.durable) await previous.done;
+    if (previous && !this.durable) {
       if (previous.digest !== digest) throw new ProtocolError('request_conflict');
       await previous.done;
       for (const reply of previous.replies) {
@@ -35,6 +41,15 @@ export class RequestLedger {
         send({ ...reply, replayed: true, ...(reply.type === 'result' ? { resyncRequired: true } : {}) });
       }
       return;
+    }
+    if (this.durable) {
+      const reservation = this.durable.reserve(playerId, requestId, digest);
+      if (reservation.status === 'conflict') throw new ProtocolError('request_conflict');
+      if (reservation.status === 'indeterminate') throw new ProtocolError('request_indeterminate');
+      if (reservation.status === 'complete') {
+        for (const reply of reservation.replies ?? []) send({ ...reply, replayed: true, resyncRequired: true });
+        return;
+      }
     }
     if (!requests) {
       if (this.players.size >= this.config.limits.maxConnections * 2) throw new ProtocolError('rate_limited');
@@ -51,6 +66,7 @@ export class RequestLedger {
     const entry: Entry = { digest, expiresAt: Date.now() + this.config.lobby.requestCacheTtlMs, replies: [], bytes: 0, completed: false, done: barrier.promise, finish: () => barrier.resolve() };
     requests.set(requestId, entry);
     let overflowed = false;
+    let durableCompleted = false;
     try {
       await operation(value => {
         const reply: Reply = { ...value, requestId };
@@ -64,9 +80,18 @@ export class RequestLedger {
           const size = Buffer.byteLength(JSON.stringify(cached));
           entry.replies.push(cached); entry.bytes += size; this.bytes += size;
         }
-        send(reply);
+        if (!this.durable) send(reply);
       });
+      if (this.durable) {
+        this.durable.complete(playerId, requestId, entry.replies);
+        durableCompleted = true;
+        for (const reply of entry.replies) send(reply);
+      }
     } finally {
+      if (this.durable && !durableCompleted) {
+        this.bytes -= entry.bytes;
+        requests.delete(requestId);
+      }
       entry.completed = true;
       entry.expiresAt = Date.now() + this.config.lobby.requestCacheTtlMs;
       entry.finish();

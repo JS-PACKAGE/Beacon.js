@@ -9,15 +9,17 @@ import { RevocationRegistry } from './auth/revocations.js';
 import { GameRegistry } from './games/index.js';
 import { RoomManager } from './lobby/index.js';
 import { startTransport, markAuthenticated } from './net/index.js';
-import type { Transport } from './net/index.js';
+import type { Transport, ControlTransport } from './net/index.js';
 import { PROTOCOL_VERSION, ProtocolError, errorMessage } from './protocol/index.js';
 import type { ClientMessage } from './protocol/index.js';
 import { RequestLedger } from './protocol/requests.js';
 import { SqliteRoomStore } from './store/index.js';
 import { log, configureLogging, closeLogging } from './log/index.js';
 import { startOperations } from './ops/index.js';
-import type { OperationsService } from './ops/index.js';
+import type { OperationsService, OperationsHooks } from './ops/index.js';
 import type { AuthProvider, GameProvider, GameSessionProvider, Peer, Player, Revocation, RoomStore } from './types.js';
+import type { ClusterCoordinator } from './cluster/index.js';
+import { startClusterBeacon } from './cluster/service.js';
 
 export interface BeaconService {
   address(): AddressInfo;
@@ -31,7 +33,16 @@ function revoked(player: Player, records: readonly Revocation[]): boolean {
     (record.playerId === player.id && (record.revokedBefore === undefined || player.issuedAt === undefined || player.issuedAt <= record.revokedBefore)));
 }
 
-export async function startBeacon(config: Config, dev: DevOptions, overrides: { store?: RoomStore; auth?: AuthProvider; games?: GameProvider; sessions?: GameSessionProvider } = {}): Promise<BeaconService> {
+export interface BeaconOverrides {
+  store?: RoomStore; auth?: AuthProvider; games?: GameProvider; sessions?: GameSessionProvider;
+  coordinator?: ClusterCoordinator; authorityEpoch?: string; control?: ControlTransport;
+  operationsFactory?: (hooks: OperationsHooks) => Promise<OperationsService>;
+}
+export async function startBeacon(config: Config, dev: DevOptions, overrides: BeaconOverrides = {}): Promise<BeaconService> {
+  if (config.cluster.enabled && !overrides.coordinator) {
+    validateConfig(config, dev);
+    return startClusterBeacon(config, dev, startBeacon, overrides);
+  }
   validateConfig(config, dev);
   await configureLogging(config.operations);
   let store: RoomStore;
@@ -41,7 +52,10 @@ export async function startBeacon(config: Config, dev: DevOptions, overrides: { 
   let operations: OperationsService | undefined;
   let lobby: RoomManager | undefined;
   const connections = new Map<string, Connection>();
-  const ledger = new RequestLedger(config);
+  const ledger = new RequestLedger(config, overrides.coordinator ? {
+    reserve: (player, request, digest) => overrides.coordinator!.reserve(player, request, digest, overrides.authorityEpoch),
+    complete: (player, request, replies) => overrides.coordinator!.complete(player, request, replies, overrides.authorityEpoch),
+  } : undefined);
   const inFlight = new Set<Promise<void>>();
   const eventLoop = monitorEventLoopDelay({ resolution: 20 });
   eventLoop.enable();
@@ -62,6 +76,7 @@ export async function startBeacon(config: Config, dev: DevOptions, overrides: { 
     const registry = new RevocationRegistry(config.auth);
     const refreshRevocations = async (): Promise<void> => {
       try {
+        overrides.coordinator?.assertLeader(overrides.authorityEpoch);
         revocations = await registry.refresh();
         await manager.enforceRevocations(revocations);
         revisionHealthy = true;
@@ -74,7 +89,7 @@ export async function startBeacon(config: Config, dev: DevOptions, overrides: { 
       }
     };
     if (config.auth.revocationUrl) await refreshRevocations();
-    const stats = (): Record<string, unknown> => ({ ...manager.stats(), connections: connections.size, inFlight: inFlight.size, maintenance, revocationHealthy: revisionHealthy, eventLoopP99Ms: eventLoop.percentile(99) / 1e6, rssBytes: process.memoryUsage().rss });
+    const stats = (): Record<string, unknown> => ({ ...manager.stats(), connections: connections.size, inFlight: inFlight.size, maintenance, revocationHealthy: revisionHealthy, eventLoopP99Ms: eventLoop.percentile(99) / 1e6, rssBytes: process.memoryUsage().rss, cluster: overrides.coordinator?.health() ?? { enabled: false, role: 'standalone', healthy: true } });
     const setMaintenance = (enabled: boolean): void => { maintenance = enabled; manager.setMaintenance(enabled); };
     const dispatch = async (connection: Connection, message: ClientMessage): Promise<void> => {
       const requestId = message.requestId;
@@ -82,6 +97,7 @@ export async function startBeacon(config: Config, dev: DevOptions, overrides: { 
       const direct = (value: Record<string, unknown>): void => connection.raw.send(requestId ? { ...value, requestId } : value);
       if (connection.raw.closed) return;
       try {
+        overrides.coordinator?.assertLeader(overrides.authorityEpoch);
         if (message.type !== 'auth') {
           if (!connection.player) throw new ProtocolError('auth_required');
           if (connection.player.expiresAt !== undefined && connection.player.expiresAt <= Date.now()) throw new ProtocolError('auth_expired');
@@ -98,6 +114,7 @@ export async function startBeacon(config: Config, dev: DevOptions, overrides: { 
               try { player = await auth.verify(message.token); }
               catch { throw new ProtocolError('auth_failed'); }
               if (connection.raw.closed) return;
+              overrides.coordinator?.assertLeader(overrides.authorityEpoch);
               if (revoked(player, revocations)) throw new ProtocolError('token_revoked');
               if (message.type === 'refresh_auth') {
                 if (player.id !== connection.player?.id) throw new ProtocolError('forbidden');
@@ -109,6 +126,7 @@ export async function startBeacon(config: Config, dev: DevOptions, overrides: { 
               if (message.type === 'auth') await manager.handle(connection.peer, { type: 'sync_state' });
             } else {
               if ((maintenance || closing) && ['create_room', 'join_room', 'quick_join', 'queue_join', 'start_game', 'party_create', 'party_accept'].includes(message.type)) throw new ProtocolError('maintenance');
+              overrides.coordinator?.assertLeader(overrides.authorityEpoch);
               await manager.handle(connection.peer, message);
             }
             if (requestId) reply({ type: 'result', ok: true });
@@ -159,9 +177,9 @@ export async function startBeacon(config: Config, dev: DevOptions, overrides: { 
         connections.delete(raw.id);
         operations?.metric('connections_closed');
       },
-    });
-    operations = await startOperations(config, {
-      stats, ready: () => !maintenance && !closing && revisionHealthy && manager.stats().storageHealthy !== false,
+    }, overrides.control);
+    const operationHooks: OperationsHooks = {
+      stats, ready: () => !maintenance && !closing && revisionHealthy && manager.stats().storageHealthy !== false && (!overrides.coordinator || overrides.coordinator.health().role === 'leader'),
       ban: async (id, until, reason) => { await manager.banPlayer(id, until, reason); ledger.clearPlayer(id); },
       unban: id => manager.unbanPlayer(id),
       revoke: async (id, before) => { await manager.revokePlayer(id, before); ledger.clearPlayer(id); },
@@ -173,11 +191,24 @@ export async function startBeacon(config: Config, dev: DevOptions, overrides: { 
         setMaintenance(enabled);
       },
       audit: limit => store.listAudit(limit),
-    });
+      rooms: (cursor, limit) => manager.listRooms(cursor, limit),
+      room: id => manager.roomDetails(id),
+      matches: (cursor, limit) => manager.listMatches(cursor, limit),
+      match: id => manager.matchDetails(id),
+      queueDiagnostics: () => manager.queueDiagnostics(),
+      integrations: () => manager.integrations(),
+      clusterHealth: () => overrides.coordinator?.health() ?? { enabled: false, role: 'standalone', healthy: true },
+      authorizeMutation: () => { overrides.coordinator?.assertLeader(overrides.authorityEpoch); },
+      reconcileMatch: id => manager.reconcileMatch(id),
+      chatReports: (cursor, limit) => manager.chatReports(cursor, limit),
+      chatReport: id => manager.chatReport(id),
+      reviewChatReport: (id, action, until, reason) => manager.reviewChatReport(id, action, until, reason),
+    };
+    operations = await (overrides.operationsFactory ? overrides.operationsFactory(operationHooks) : startOperations(config, operationHooks));
     timer = setInterval(() => {
       if (maintenanceJob || closing) return;
       ledger.sweep();
-      maintenanceJob = manager.maintain().catch(() => { operations?.metric('maintenance_errors'); log('error', 'maintenance_failed'); }).finally(() => { maintenanceJob = undefined; });
+      maintenanceJob = Promise.resolve().then(() => { overrides.coordinator?.assertLeader(overrides.authorityEpoch); return manager.maintain(); }).catch(() => { operations?.metric('maintenance_errors'); log('error', 'maintenance_failed'); }).finally(() => { maintenanceJob = undefined; });
     }, config.limits.maintenanceIntervalMs);
     timer.unref();
     if (config.auth.revocationUrl) {
@@ -202,13 +233,16 @@ export async function startBeacon(config: Config, dev: DevOptions, overrides: { 
           await activeTransport.close();
           await Promise.allSettled([...inFlight]);
           await Promise.allSettled([...(maintenanceJob ? [maintenanceJob] : []), ...(revocationJob ? [revocationJob] : [])]);
-          await manager.close();
-          await manager.settle();
-          await activeOperations.close();
-          ledger.clear();
-          store.close();
-          eventLoop.disable();
-          await closeLogging();
+          try {
+            await manager.close();
+            await manager.settle();
+          } finally {
+            await activeOperations.close();
+            ledger.clear();
+            store.close();
+            eventLoop.disable();
+            await closeLogging();
+          }
         })();
         return closing;
       },
@@ -217,7 +251,7 @@ export async function startBeacon(config: Config, dev: DevOptions, overrides: { 
     clearInterval(timer);
     clearInterval(revocationTimer);
     await transport?.close();
-    await lobby?.close();
+    await lobby?.close().catch(() => undefined);
     await operations?.close();
     store.close();
     eventLoop.disable();
