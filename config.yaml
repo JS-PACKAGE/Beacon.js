@@ -38,6 +38,9 @@
     "cacheTtlSec": 60, # 遊戲清單快取有效秒數
     "sessionApiUrl": "", # 真實配對 API；未設定時拒絕開始遊戲
     "serviceTokenFile": "", # 私密一般檔案 (0600)，不得符號連結
+    "profileApiUrl": "", # 遊戲後端的權威技能與實測延遲 API；空值拒絕 advanced 配對
+    "profileMaxAgeMs": 60000,
+    # Profile 新鮮度是硬性信任界線；資料過期不得降級成不可信配對
     "fallback": [ # API 不可達時的啟動備援，正式環境須換成實際遊戲
       { "gameId": "g-001", "name": "Demo game", "maxPlayersPerRoom": 8, "enabled": true },
       { "gameId": "g-002", "name": "Second game", "maxPlayersPerRoom": 4, "enabled": true }
@@ -52,7 +55,29 @@
     "inviteTtlMs": 300000, # 房間／隊伍邀請的有效毫秒數
     "maxSpectators": 16, # 每房觀戰者上限的預設與最大值；0＝不允許觀戰
     "matchmakingWaitMs": 60000, # 自動配對最長等待毫秒數，逾時退出佇列
-    "maxPartySize": 8 # 隊伍人數上限
+    "maxPartySize": 8, # 整隊上限，配對與進房不得拆隊
+    "matchConfirmMs": 15000, # 配對提案全員接受期限，毫秒
+    "resultRetentionMs": 604800000, # 私人場次結果與 ACK 保留毫秒數
+    "maxResults": 50000, # 私人結果總筆數上限
+    "invitationRetentionMs": 86400000 # 已處理／過期邀請的保留毫秒數
+  },
+  "matching": { # 所有配對共用的有界搜尋與等待放寬政策，不接受客戶端自報技能／延遲
+    "skillSpread": 200, "maxSkillSpread": 1000,
+    "teamSkillDelta": 100, "maxTeamSkillDelta": 500,
+    "latencyMs": 80, "maxLatencyMs": 200,
+    "relaxAfterMs": 30000, "relaxEveryMs": 15000,
+    "skillStep": 100, "latencyStep": 20, "searchLimit": 100000
+  },
+  "chat": { # 僅房間／隊伍聊天；獨立限流、私密歷史、檢舉與禁言保留界線
+    "maxTextLength": 500, "retentionMs": 86400000, "maxMessages": 10000,
+    "reportRetentionMs": 2592000000, "maxReports": 10000,
+    "burst": 5, "windowMs": 10000, "maxMuteMs": 86400000
+  },
+  "cluster": { # 選用跨主機 HA；正式需私有 WSS、etcd HTTPS 認證，SQLite 不共用網路檔案
+    "enabled": false, "nodeId": "beacon-1", "endpoints": [], "prefix": "/beacon",
+    "leaseTtlSeconds": 15, "requestTimeoutMs": 3000, "maxSnapshotBytes": 524288, "maxStateBytes": 67108864, "checkpointInterval": 32, "development": false,
+    "control": { "listenHost": "127.0.0.1", "listenPort": 34570, "advertiseUrl": "", "secretPath": "", "certPath": "", "keyPath": "", "caPath": "" },
+    "etcd": { "username": "", "passwordPath": "", "caPath": "", "certPath": "", "keyPath": "" }
   },
   "operations": { # 內部管理與維運；各項留空即明確停用，不會假裝成功
     "enabled": false, # true 才開啟 loopback 管理 HTTP（所有端點皆需 bearer token）

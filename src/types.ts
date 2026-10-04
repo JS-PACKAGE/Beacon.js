@@ -1,3 +1,5 @@
+import type { GameCapabilities } from './games/capabilities.js';
+import type { TrustedProfile } from './games/profiles.js';
 export interface Player {
   id: string;
   displayName: string;
@@ -16,9 +18,10 @@ export interface Game {
   versions?: readonly string[];
   modes?: readonly string[];
   regions?: readonly string[];
+  capabilities?: GameCapabilities;
 }
 export interface AuthProvider { verify(token: string): Promise<Player> }
-export interface GameProvider { list(force?: boolean): Promise<readonly Game[]> }
+export interface GameProvider { list(force?: boolean): Promise<readonly Game[]>; profiles?(gameId: string, playerIds: readonly string[]): Promise<readonly TrustedProfile[]> }
 export interface Peer {
   readonly id: string;
   readonly ip: string;
@@ -72,6 +75,7 @@ export interface StoredRoom {
   invitedIds: string[];
   matchId: string | null;
   matchRequest?: MatchRequest;
+  assignments?: MatchRequest['players'];
   rules?: Rules;
   seats?: ReconnectSeat[];
   createdAt: number;
@@ -111,8 +115,9 @@ export interface MatchRequest {
   operationId: string;
   roomId: string;
   gameId: string;
-  players: { id: string; role: 'player' | 'spectator' }[];
+  players: { id: string; role: 'player' | 'spectator'; team?: number; gameRole?: string }[];
   version: string;
+  joinPolicy?: 'closed' | 'fill' | 'spectate';
   mode: string;
   region: string;
   rules?: Rules;

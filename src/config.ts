@@ -2,13 +2,17 @@ import { readFile } from 'node:fs/promises';
 import { isIP } from 'node:net';
 import type { Game } from './types.js';
 import { readSecretFile } from './auth/secrets.js';
+import { parseCapabilities } from './games/capabilities.js';
 
 export interface Config {
   server: { listenHost: string; listenPort: number; trustProxy: boolean; trustedProxyAddresses: string[]; allowedOrigins: string[]; allowNoOrigin: boolean };
   public: { domain: string; tls: 'proxy' | 'direct'; certPath: string; keyPath: string };
   auth: { mode: 'mock' | 'jwks' | 'remote'; jwksUrl: string; issuer: string; audience: string; apiUrl: string; timeoutMs: number; jwksCacheTtlSec: number; mockPlayers: { token: string; id: string; displayName: string }[]; revocationUrl: string; revocationTokenFile: string; revocationIntervalMs: number };
-  games: { apiUrl: string; timeoutMs: number; cacheTtlSec: number; fallback: Omit<Game, 'source'>[]; sessionApiUrl: string; serviceTokenFile: string };
-  lobby: { reconnectGraceMs: number; maxRoomsPerPlayer: number; requestCacheSize: number; requestCacheTtlMs: number; snapshotTtlMs: number; inviteTtlMs: number; maxSpectators: number; matchmakingWaitMs: number; maxPartySize: number };
+  games: { apiUrl: string; timeoutMs: number; cacheTtlSec: number; fallback: Omit<Game, 'source'>[]; sessionApiUrl: string; serviceTokenFile: string; profileApiUrl: string; profileMaxAgeMs: number };
+  lobby: { reconnectGraceMs: number; maxRoomsPerPlayer: number; requestCacheSize: number; requestCacheTtlMs: number; snapshotTtlMs: number; inviteTtlMs: number; maxSpectators: number; matchmakingWaitMs: number; maxPartySize: number; matchConfirmMs: number; resultRetentionMs: number; maxResults: number; invitationRetentionMs: number };
+  matching: { skillSpread: number; maxSkillSpread: number; teamSkillDelta: number; maxTeamSkillDelta: number; latencyMs: number; maxLatencyMs: number; relaxAfterMs: number; relaxEveryMs: number; skillStep: number; latencyStep: number; searchLimit: number };
+  chat: { maxTextLength: number; retentionMs: number; maxMessages: number; reportRetentionMs: number; maxReports: number; burst: number; windowMs: number; maxMuteMs: number };
+  cluster: { enabled: boolean; nodeId: string; endpoints: string[]; prefix: string; leaseTtlSeconds: number; requestTimeoutMs: number; maxSnapshotBytes: number; maxStateBytes: number; checkpointInterval: number; development: boolean; control: { listenHost: string; listenPort: number; advertiseUrl: string; secretPath: string; certPath: string; keyPath: string; caPath: string }; etcd: { username: string; passwordPath: string; caPath: string; certPath: string; keyPath: string } };
   operations: { enabled: boolean; listenHost: string; listenPort: number; tokenFile: string; logPath: string; logMaxBytes: number; logFiles: number; backupDirectory: string; backupIntervalMs: number; backupRetention: number; alertUrl: string; alertTokenFile: string; alertIntervalMs: number; drainTimeoutMs: number };
   room: { emptyTtlSec: number };
   db: { path: string };
@@ -45,7 +49,7 @@ function keys(object: Record<string, unknown>, allowed: readonly string[], name:
 
 export function validateConfig(value: unknown, dev: DevOptions): Config {
   const root = record(value, 'root');
-  keys(root, ['server', 'public', 'auth', 'games', 'room', 'db', 'limits', 'lobby', 'operations'], 'root');
+  keys(root, ['server', 'public', 'auth', 'games', 'room', 'db', 'limits', 'lobby', 'matching', 'operations', 'chat', 'cluster'], 'root');
   const server = record(root.server, 'server');
   keys(server, ['listenHost', 'listenPort', 'trustProxy', 'trustedProxyAddresses', 'allowedOrigins', 'allowNoOrigin'], 'server');
   string(server.listenHost, 'listenHost');
@@ -77,15 +81,17 @@ export function validateConfig(value: unknown, dev: DevOptions): Config {
     for (const key of ['token', 'id', 'displayName']) string(player[key], `mockPlayers.${key}`);
   }
   const games = record(root.games, 'games');
-  keys(games, ['apiUrl', 'timeoutMs', 'cacheTtlSec', 'fallback', 'sessionApiUrl', 'serviceTokenFile'], 'games');
+  keys(games, ['apiUrl', 'timeoutMs', 'cacheTtlSec', 'fallback', 'sessionApiUrl', 'serviceTokenFile', 'profileApiUrl', 'profileMaxAgeMs'], 'games');
+  string(games.profileApiUrl, 'games.profileApiUrl', true); integer(games.profileMaxAgeMs, 'games.profileMaxAgeMs');
   string(games.sessionApiUrl, 'games.sessionApiUrl', true); string(games.serviceTokenFile, 'games.serviceTokenFile', true);
   if (games.serviceTokenFile) readSecretFile(games.serviceTokenFile);
   string(games.apiUrl, 'games.apiUrl', true); integer(games.timeoutMs, 'games.timeoutMs'); integer(games.cacheTtlSec, 'games.cacheTtlSec');
   if (!Array.isArray(games.fallback)) throw new Error('Invalid games.fallback');
   for (const entry of games.fallback) {
     const game = record(entry, 'fallback');
-    for (const key of Object.keys(game)) if (!['gameId', 'name', 'maxPlayersPerRoom', 'enabled', 'serverHint', 'versions', 'modes', 'regions'].includes(key)) throw new Error(`Unknown config game key: ${key}`);
+    for (const key of Object.keys(game)) if (!['gameId', 'name', 'maxPlayersPerRoom', 'enabled', 'serverHint', 'versions', 'modes', 'regions', 'capabilities'].includes(key)) throw new Error(`Unknown config game key: ${key}`);
     string(game.gameId, 'gameId'); string(game.name, 'game.name'); integer(game.maxPlayersPerRoom, 'maxPlayersPerRoom'); boolean(game.enabled, 'game.enabled');
+    if (game.capabilities !== undefined) game.capabilities = parseCapabilities(game.capabilities, Number(game.maxPlayersPerRoom));
     if (game.serverHint !== undefined) string(game.serverHint, 'serverHint');
     for (const key of ['versions', 'modes', 'regions']) if (game[key] !== undefined) {
       const values = game[key];
@@ -103,10 +109,48 @@ export function validateConfig(value: unknown, dev: DevOptions): Config {
   if (operations.enabled && !operations.tokenFile) throw new Error('Operations requires a token file');
   for (const key of ['tokenFile', 'alertTokenFile']) if (operations[key]) readSecretFile(String(operations[key]));
   const lobby = record(root.lobby, 'lobby');
-  const lobbyKeys = ['reconnectGraceMs', 'maxRoomsPerPlayer', 'requestCacheSize', 'requestCacheTtlMs', 'snapshotTtlMs', 'inviteTtlMs', 'maxSpectators', 'matchmakingWaitMs', 'maxPartySize'];
+  const lobbyKeys = ['reconnectGraceMs', 'maxRoomsPerPlayer', 'requestCacheSize', 'requestCacheTtlMs', 'snapshotTtlMs', 'inviteTtlMs', 'maxSpectators', 'matchmakingWaitMs', 'maxPartySize', 'matchConfirmMs', 'resultRetentionMs', 'maxResults', 'invitationRetentionMs'];
   keys(lobby, lobbyKeys, 'lobby');
   for (const key of lobbyKeys) integer(lobby[key], `lobby.${key}`, key === 'maxSpectators' || key === 'reconnectGraceMs' ? 0 : 1);
-  for (const endpoint of [auth.mode === 'jwks' ? auth.jwksUrl : auth.apiUrl, auth.revocationUrl, games.apiUrl, games.sessionApiUrl, operations.alertUrl]) {
+  const matching = record(root.matching, 'matching');
+  const matchingKeys = ['skillSpread', 'maxSkillSpread', 'teamSkillDelta', 'maxTeamSkillDelta', 'latencyMs', 'maxLatencyMs', 'relaxAfterMs', 'relaxEveryMs', 'skillStep', 'latencyStep', 'searchLimit'];
+  keys(matching, matchingKeys, 'matching');
+  for (const key of matchingKeys) integer(matching[key], `matching.${key}`, key === 'relaxEveryMs' || key === 'searchLimit' ? 1 : 0);
+  if (Number(matching.maxSkillSpread) < Number(matching.skillSpread) || Number(matching.maxTeamSkillDelta) < Number(matching.teamSkillDelta) || Number(matching.maxLatencyMs) < Number(matching.latencyMs) || Number(matching.searchLimit) > 1000000) throw new Error('Invalid matching policy');
+  const chat = record(root.chat, 'chat');
+  const chatKeys = ['maxTextLength','retentionMs','maxMessages','reportRetentionMs','maxReports','burst','windowMs','maxMuteMs'];
+  keys(chat, chatKeys, 'chat'); for (const key of chatKeys) integer(chat[key], `chat.${key}`);
+  if (Number(chat.maxTextLength) > 2000) throw new Error('Chat text limit exceeds protocol limit');
+  const cluster = record(root.cluster, 'cluster');
+  keys(cluster, ['enabled','nodeId','endpoints','prefix','leaseTtlSeconds','requestTimeoutMs','maxSnapshotBytes','maxStateBytes','checkpointInterval','development','control','etcd'], 'cluster');
+  boolean(cluster.enabled, 'cluster.enabled'); boolean(cluster.development, 'cluster.development'); string(cluster.nodeId, 'cluster.nodeId'); string(cluster.prefix, 'cluster.prefix');
+  strings(cluster.endpoints, 'cluster.endpoints');
+  for (const key of ['leaseTtlSeconds','requestTimeoutMs','maxSnapshotBytes']) integer(cluster[key], `cluster.${key}`, key === 'leaseTtlSeconds' ? 5 : 1);
+  integer(cluster.maxSnapshotBytes, 'cluster.maxSnapshotBytes', 1024, 900000); integer(cluster.maxStateBytes, 'cluster.maxStateBytes', Number(cluster.maxSnapshotBytes), 268435456); integer(cluster.checkpointInterval, 'cluster.checkpointInterval', 1, 128);
+  if (Number(cluster.requestTimeoutMs) >= Number(cluster.leaseTtlSeconds) * 250) throw new Error('Cluster request timeout must be below one quarter lease lifetime');
+  const control = record(cluster.control, 'cluster.control');
+  keys(control, ['listenHost','listenPort','advertiseUrl','secretPath','certPath','keyPath','caPath'], 'cluster.control');
+  string(control.listenHost, 'cluster.control.listenHost'); if (!isLoopback(control.listenHost)) throw new Error('Cluster control must listen on loopback');
+  integer(control.listenPort, 'cluster.control.listenPort', 0, 65535);
+  for (const key of ['advertiseUrl','secretPath']) string(control[key], `cluster.control.${key}`, cluster.enabled !== true);
+  for (const key of ['certPath','keyPath','caPath']) string(control[key], `cluster.control.${key}`, true);
+  const etcd = record(cluster.etcd, 'cluster.etcd'); keys(etcd, ['username','passwordPath','caPath','certPath','keyPath'], 'cluster.etcd');
+  for (const key of ['username','passwordPath','caPath','certPath','keyPath']) string(etcd[key], `cluster.etcd.${key}`, true);
+  if (cluster.enabled) {
+    if (!(cluster.endpoints as string[]).length) throw new Error('Cluster requires etcd endpoints');
+    if (cluster.development && !dev.insecureWs) throw new Error('Development cluster requires explicit development transport flag');
+    for (const endpoint of cluster.endpoints as string[]) {
+      const url = new URL(endpoint);
+      if (url.username || url.password || url.hash || (url.protocol !== 'https:' && !(cluster.development && url.protocol === 'http:' && isLoopback(url.hostname.replace(/^\[|\]$/g, ''))))) throw new Error('Etcd endpoints require authenticated TLS, or loopback development HTTP');
+    }
+    const controlUrl = new URL(String(control.advertiseUrl));
+    if (controlUrl.username || controlUrl.password || controlUrl.hash || (controlUrl.protocol !== 'wss:' && !(cluster.development && controlUrl.protocol === 'ws:' && isLoopback(controlUrl.hostname.replace(/^\[|\]$/g, ''))))) throw new Error('Cluster control requires WSS, or loopback development WS');
+    if (Boolean(control.certPath) !== Boolean(control.keyPath)) throw new Error('Cluster control certificate and key must be configured together');
+    readSecretFile(String(control.secretPath));
+    if (!cluster.development && (!etcd.username || !etcd.passwordPath || !etcd.caPath || !control.certPath || !control.keyPath || !control.caPath)) throw new Error('Production cluster requires authenticated TLS');
+    if (etcd.passwordPath) readSecretFile(String(etcd.passwordPath));
+  }
+  for (const endpoint of [auth.mode === 'jwks' ? auth.jwksUrl : auth.apiUrl, auth.revocationUrl, games.apiUrl, games.sessionApiUrl, games.profileApiUrl, operations.alertUrl]) {
     if (endpoint) {
       const url = new URL(String(endpoint));
       if (url.username || url.password || url.hash) throw new Error('API URLs cannot contain credentials or fragments');

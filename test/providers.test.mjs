@@ -34,6 +34,7 @@ async function http(t, handler) {
 function reply(res, body, status = 200) { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); }
 const fallback = [{ gameId: 'fallback', name: '備援', maxPlayersPerRoom: 4, enabled: true }];
 const remoteGame = { gameId: 'g1', name: '遊戲一', maxPlayersPerRoom: 8, enabled: true, serverHint: 'wss://game.example/play' };
+const sessionConfig = { apiUrl: '', cacheTtlSec: 60, fallback: [], profileApiUrl: '', profileMaxAgeMs: 60000 };
 
 test('mock only accepts explicit configured tokens and returns independent identities', async () => {
   const provider = createAuthProvider({ ...config, mode: 'mock' });
@@ -197,7 +198,7 @@ test('game sessions perform real bounded lifecycle with idempotency and bearer c
     else if (req.method === 'GET') reply(res, { state: 'in_game' });
     else reply(res, { matchId: 'match/one', serverUrl: 'wss://game.example/play', expiresAt, tickets: { alice: 'alice-ticket' } }, 201);
   });
-  const provider = new HttpGameSessions({ sessionApiUrl: url + '/base', serviceTokenFile: tokenFile, timeoutMs: 500 });
+  const provider = new HttpGameSessions({ ...sessionConfig, sessionApiUrl: url + '/base', serviceTokenFile: tokenFile, timeoutMs: 500 });
   const allocated = await provider.create({ operationId: 'op-one', roomId: 'room', gameId: 'game', players: [{ id: 'alice', role: 'player' }], version: '1', mode: '', region: '' });
   assert.equal(allocated.tickets.alice, 'alice-ticket');
   assert.equal((await provider.admit(allocated.matchId, 'bob', 'spectator')).ticket, 'admitted');
@@ -207,7 +208,7 @@ test('game sessions perform real bounded lifecycle with idempotency and bearer c
   assert.ok(seen.every(r => r.authorization === 'Bearer private-service-token'));
   assert.equal(seen[0].key, 'op-one');
   assert.deepEqual(JSON.parse(seen[1].body), { playerId: 'bob', role: 'spectator' });
-  await assert.rejects(new HttpGameSessions({ sessionApiUrl: '', serviceTokenFile: '', timeoutMs: 50 }).status('match'), error => error.code === 'game_service_unavailable');
+  await assert.rejects(new HttpGameSessions({ ...sessionConfig, sessionApiUrl: '', serviceTokenFile: '', timeoutMs: 50 }).status('match'), error => error.code === 'game_service_unavailable');
 });
 
 test('revocation registry rejects malformed/oversized/unreachable data and retains verified JWT revocation claims', async t => {
@@ -259,7 +260,7 @@ test('game lifecycle rejects invalid allocations/states, redirect leakage, slow 
     if (behavior === 'large') { res.end('x'.repeat(262145)); return; }
     reply(res, behavior === 'state' ? { state: 'invented' } : { matchId: 'match', serverUrl: 'wss://game.example', expiresAt: Date.now() + 1000, tickets: {} });
   });
-  const provider = new HttpGameSessions({ sessionApiUrl: url, serviceTokenFile: '', timeoutMs: 30 });
+  const provider = new HttpGameSessions({ ...sessionConfig, sessionApiUrl: url, serviceTokenFile: '', timeoutMs: 30 });
   for (behavior of ['state', 'redirect', 'large', 'slow']) await assert.rejects(provider.status('match'), error => error.code === 'game_service_unavailable' && !error.message.includes('elsewhere'));
   behavior = 'allocation';
   await assert.rejects(provider.create({ operationId: 'op', roomId: 'r', gameId: 'g', players: [{ id: 'alice', role: 'player' }], version: '', mode: '', region: '' }));
@@ -284,7 +285,7 @@ test('game allocation capacity is bounded by actual request bytes rather than an
     calls++;
     reply(res, { matchId: 'large-match', serverUrl: 'wss://game.example', expiresAt: Date.now() + 60000, tickets: Object.fromEntries(body.players.map(player => [player.id, 'ticket'])) });
   });
-  const provider = new HttpGameSessions({ sessionApiUrl: url, serviceTokenFile: '', timeoutMs: 500 });
+  const provider = new HttpGameSessions({ ...sessionConfig, sessionApiUrl: url, serviceTokenFile: '', timeoutMs: 500 });
   const input = { operationId: 'op', roomId: 'r', gameId: 'g', players: Array.from({ length: 1025 }, (_, i) => ({ id: `p${i}`, role: 'player' })), version: '', mode: '', region: '' };
   assert.equal(Object.keys((await provider.create(input)).tickets).length, 1025);
   assert.equal(calls, 1);

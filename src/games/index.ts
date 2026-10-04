@@ -2,6 +2,8 @@ import type { Config } from '../config.js';
 import type { Game, GameProvider } from '../types.js';
 import { log } from '../log/index.js';
 import { apiEndpoint, requestJson } from '../auth/http.js';
+import { parseCapabilities } from './capabilities.js';
+import { HttpGameProfiles, type TrustedProfile } from './profiles.js';
 
 function boundedText(value: unknown, max: number): value is string {
   return typeof value === 'string' && value.length > 0 && Buffer.byteLength(value) <= max && !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
@@ -24,6 +26,7 @@ function games(value: unknown, source: Game['source']): readonly Game[] {
       if (!Array.isArray(values) || values.length > 32 || !values.every(v => boundedText(v, 64))) throw new Error('Invalid game registry');
       result[key] = Object.freeze([...values]) as readonly string[];
     }
+    if (item.capabilities !== undefined) result.capabilities = parseCapabilities(item.capabilities, result.maxPlayersPerRoom);
     return Object.freeze(result);
   }));
 }
@@ -33,8 +36,13 @@ export class GameRegistry implements GameProvider {
   private cachedProjection: readonly Game[] | undefined;
   private expiresAt = 0;
   private inFlight: Promise<readonly Game[]> | undefined;
+  private profileAdapter: HttpGameProfiles | undefined;
   constructor(private readonly config: Config['games']) {
     this.fallback = games(config.fallback, 'config');
+  }
+  profiles(gameId: string, playerIds: readonly string[]): Promise<readonly TrustedProfile[]> {
+    this.profileAdapter ??= new HttpGameProfiles(this.config);
+    return this.profileAdapter.profiles(gameId, playerIds);
   }
   async list(force = false): Promise<readonly Game[]> {
     if (!this.config.apiUrl) return this.fallback;

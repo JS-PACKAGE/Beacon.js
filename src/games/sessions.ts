@@ -3,6 +3,8 @@ import type { Admission, GameSessionProvider, MatchAllocation, MatchRequest } fr
 import { readRules } from '../protocol/index.js';
 import { apiEndpoint, requestJson, type JsonRequestOptions } from '../auth/http.js';
 import { readSecretFile } from '../auth/secrets.js';
+import { GameRegistry } from './index.js';
+import { validateGameSettings } from './capabilities.js';
 
 export class GameSessionError extends Error {
   readonly code = 'game_service_unavailable';
@@ -24,8 +26,10 @@ function admission(value: unknown): Admission {
 }
 export class HttpGameSessions implements GameSessionProvider {
   private readonly token: string | undefined;
+  private readonly registry: GameRegistry;
   constructor(private readonly config: Config['games']) {
     this.token = config.serviceTokenFile ? readSecretFile(config.serviceTokenFile) : undefined;
+    this.registry = new GameRegistry(config);
   }
   private async request(path: string, options: JsonRequestOptions): Promise<unknown> {
     try {
@@ -36,6 +40,12 @@ export class HttpGameSessions implements GameSessionProvider {
   async create(input: MatchRequest): Promise<MatchAllocation> {
     try {
       if (!text(input.operationId) || !text(input.roomId) || !text(input.gameId) || !Array.isArray(input.players) || !input.players.length || new Set(input.players.map(p => p.id)).size !== input.players.length || !input.players.every(p => text(p.id) && ['player', 'spectator'].includes(p.role)) || ![input.version, input.mode, input.region].every(v => typeof v === 'string' && Buffer.byteLength(v) <= 64 && !/[\p{Cc}\p{Cs}]/u.test(v)) || (input.rules !== undefined && JSON.stringify(readRules(input.rules)) !== JSON.stringify(input.rules))) throw new GameSessionError();
+      if (!input.players.every(p => (p.team === undefined || (Number.isSafeInteger(p.team) && p.team >= 0 && p.team < 16)) && (p.gameRole === undefined || text(p.gameRole, 64)))) throw new GameSessionError();
+      const game = (await this.registry.list()).find(g => g.gameId === input.gameId);
+      if (game?.capabilities) {
+        const rules = validateGameSettings(game, { maxPlayers: game.maxPlayersPerRoom, joinPolicy: input.joinPolicy ?? 'closed', ...(input.rules === undefined ? {} : { rules: input.rules }), players: input.players });
+        input = { ...input, ...(rules === undefined ? {} : { rules }) };
+      }
       const data = object(await this.request('/v1/matches', { method: 'POST', headers: { 'Idempotency-Key': input.operationId }, body: input, statuses: [200, 201] }));
       const tickets = object(data.tickets);
       if (!text(data.matchId) || Object.keys(tickets).length !== input.players.length || !input.players.every(p => text(tickets[p.id], 8192))) throw new GameSessionError();
