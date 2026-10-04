@@ -162,6 +162,16 @@ sudo launchctl bootout system/app.ysgs.beacon
 sudo launchctl bootstrap system /Library/LaunchDaemons/app.ysgs.beacon.plist
 ```
 
+### Linux systemd（腳本已備，本環境未執行）
+
+未來機房若改 Linux，用 `scripts/install-systemd.mjs`。它只接受 Linux、只接受 root 安裝，並把應用降權到已存在的非 root `--user`。既有 `/etc/systemd/system/beacon.service` 不覆寫。本機是 macOS，此腳本沒有在這裡執行，不宣稱 Linux 部署通過。
+
+```sh
+sudo "$(command -v node)" scripts/install-systemd.mjs --directory "$PWD" --user beacon --node "$(command -v node)" --config "$PWD/config.yaml"
+```
+
+`--user` 必須是已存在的非 root 使用者。成功後可用 `systemctl status beacon.service` 查看；stdout／stderr 在專案 `logs/`（0700）。
+
 ### Cloudflare Tunnel（獨立 LaunchDaemon）
 
 使用者於 Cloudflare 建立 Tunnel、DNS hostname 與 HTTPS 邊緣規則，不由腳本呼叫雲端。將 hostname 對應至設定 listenPort 的 `http://127.0.0.1:<port>`，保留設定網域 Host，傳送 `X-Forwarded-Proto: https`。本程序代理模式只信任設定的 loopback 代理，驗證 forwarded HTTPS 與 domain Host；非 loopback 一律拒絕。不要將受信任代理設成任意來源。
